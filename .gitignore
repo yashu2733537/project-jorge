@@ -1,0 +1,24 @@
+# secrets — never commit
+.env
+
+# WhatsApp session (contains your linked-device credentials)
+whatsapp-bot/wa_session/
+whatsapp-bot/qr.png
+
+# runtime / personal data
+memory.txt
+conversations.jsonl
+wa_history_*.json
+models_state.json
+self_index.txt
+assistant.py.bak
+
+# logs
+*.log
+
+# python
+__pycache__/
+*.pyc
+
+# node
+whatsapp-bot/node_modules/

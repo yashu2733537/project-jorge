@@ -1,0 +1,13 @@
+{
+  "name": "jorge-whatsapp",
+  "version": "1.0.0",
+  "description": "Jorge — WhatsApp bot",
+  "main": "bot.js",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "link-preview-js": "^3.2.0",
+    "pino": "^10.3.1",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
