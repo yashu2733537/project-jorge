@@ -1,0 +1,38 @@
+{
+  "$schema": "../workflow.schema.json",
+  "name": "disk-check-and-alert",
+  "description": "Check disk usage; notify if over the threshold, else just log.",
+  "notify": {
+    "ntfy": { "on": ["success", "error", "retry"], "topic": "jorge" }
+  },
+  "vars": {
+    "threshold": 70
+  },
+  "retries": 0,
+  "timeout": 60,
+  "steps": [
+    {
+      "id": "disk",
+      "tool": "shell",
+      "description": "Grab disk usage percentage",
+      "params": { "command": "df -P / | awk 'NR==2{print $5}' | tr -d '%'" }
+    },
+    {
+      "id": "over_threshold",
+      "tool": "expr",
+      "description": "Compare disk usage against threshold",
+      "params": { "name": "disk_pct", "value": "int(steps.disk.output)" }
+    },
+    {
+      "id": "alert",
+      "tool": "notify",
+      "description": "Only alert when the threshold is exceeded",
+      "if": "vars.disk_pct > threshold",
+      "params": {
+        "channel": "ntfy",
+        "title": "Disk usage alert",
+        "message": "Disk is at ${vars.disk_pct}% (threshold ${threshold})."
+      }
+    }
+  ]
+}

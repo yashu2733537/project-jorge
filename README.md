@@ -6,12 +6,17 @@ A terminal AI assistant that chats naturally, sends emails, searches the web, so
 
 - **Chat** — natural conversation with memory across sessions (`conversations.jsonl`)
 - **Email** — AI-drafted emails sent via Gmail SMTP
+- **Email drafting** — tone-aware drafts (professional/friendly/casual/formal/warm/direct/urgent) with optional conversation-context recall, reviewed before sending
 - **Web search** — DuckDuckGo search, with AI-summarized answers
+- **Web research** — deep searches summarized with numbered source citations
 - **File sorting** — organizes a folder into categories by file type
+- **File organization** — organizes by file type *and* naming patterns (IMG_, Screenshot, invoice, resume, …)
 - **Memory** — remembers notes you give it (`memory.txt`)
+- **System monitoring** — CPU/memory/disk usage, load, top processes, with configurable alert thresholds
 - **Shell / file ops** — runs commands, reads/writes/lists files (ask it nicely)
 - **Self-awareness** — knows its own code (auto-generated index) and can inspect, edit, and debug its own source
 - **Delegation** — hands big coding tasks to `opencode` (if installed), which does them fully autonomously
+- **Task breakdown** — splits a complex task into sub-steps, then delegates them
 - **Self-improvement** — tell it "build yourself new skills" and it proposes + creates real opencode skills
 - **WhatsApp bot** (optional) — talk to it from your own WhatsApp via the self-chat
 
@@ -36,8 +41,13 @@ cp .env.example .env
 # 3. Run it
 python3 assistant.py chat          # interactive chat
 python3 assistant.py email --to friend@example.com --subject "Hi" --topic "say hello"
+python3 assistant.py email-draft --to friend@example.com --topic "ask about saturday" --tone friendly --recall
 python3 assistant.py web "best free vps 2026" --ask
+python3 assistant.py research "best free vps 2026" --ask
 python3 assistant.py sort ~/Downloads --dry-run
+python3 assistant.py organize ~/Downloads --dry-run
+python3 assistant.py monitor --cpu 80
+python3 assistant.py breakdown "build a node app, test it, deploy it" --dry-run
 python3 assistant.py help
 ```
 

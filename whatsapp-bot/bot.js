@@ -152,11 +152,31 @@ sock.ev.on("messages.upsert", async (m) => {
       if (seen.has(msg.key.id)) return;
       seen.add(msg.key.id);
       if (seen.size > 500) seen.clear();
+      const OWNER = new Set();
+      const addOwner = (jid) => {
+        if (!jid) return;
+        const num = jid.split(":")[0];
+        OWNER.add(num);
+        if (num.endsWith("@lid")) OWNER.add(num.replace(/@lid$/, "@s.whatsapp.net"));
+      };
+      addOwner(sock.user?.id);
+      addOwner(process.env.JORGE_LID);
+      if (process.env.JORGE_PHONE) addOwner(process.env.JORGE_PHONE + "@s.whatsapp.net");
+      const sender = (msg.key.participant || msg.key.remoteJid || "").split(":")[0];
+      const isOwner = !!msg.key.fromMe || OWNER.has(sender);
       if (msg.key.fromMe && sentIds.has(msg.key.id)) return;
       const text =
         msg.message.conversation || msg.message.extendedTextMessage?.text || "";
-      if (!text.trim()) return;
-      const cmd = text.trim().toLowerCase();
+      const raw = text.trim();
+      if (!raw) return;
+      const cmd = raw.toLowerCase();
+      const TRIGGER = "@jorge";
+      console.log(`  <raw ${m.type} fromMe=${!!msg.key.fromMe} ${msg.key.remoteJid}${msg.key.participant ? " via " + msg.key.participant : ""}: ${raw.slice(0, 50)}`);
+      if (cmd.startsWith(TRIGGER) && !isOwner) {
+        await send(sock, msg.key.remoteJid, "i only listen to the boss");
+        return;
+      }
+      if (!isOwner) return;
       const ABORT_WORDS = new Set(["abort", "stop", "cancel", "abort task", "stop task", "cancel task"]);
       if (ABORT_WORDS.has(cmd)) {
         const entry = activeBridges.get(msg.key.remoteJid);
@@ -177,18 +197,20 @@ sock.ev.on("messages.upsert", async (m) => {
         }
         return;
       }
-      if (cmd === "!status") {
+      if (!cmd.startsWith(TRIGGER)) return;
+      const payload = raw.slice(TRIGGER.length).trim() || "hi";
+      if (payload.toLowerCase() === "!status") {
         await send(sock, msg.key.remoteJid, "jorge is online ⚡");
         return;
       }
-      if (cmd === "!quit") {
+      if (payload.toLowerCase() === "!quit") {
         await send(sock, msg.key.remoteJid, "bye! 🤠");
         process.exit(0);
       }
-      console.log(`  < ${msg.key.remoteJid}: ${text.slice(0, 80)}`);
+      console.log(`  < ${msg.key.remoteJid}: ${payload.slice(0, 80)}`);
       await sock.sendPresenceUpdate("composing", msg.key.remoteJid);
       try {
-        const res = await bridgeCall(msg.key.remoteJid, text, msg.key.remoteJid, sock);
+        const res = await bridgeCall(msg.key.remoteJid, payload, msg.key.remoteJid, sock);
         if (!res.aborted && res.reply !== null) {
           await send(sock, msg.key.remoteJid, res.reply);
         }

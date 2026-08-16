@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://jorge.local/pursuit/workflow.schema.json",
+  "title": "Jorge Pursuit Workflow",
+  "description": "Defines a multi-step task (workflow) for jorge's persistent pursuit system.",
+  "type": "object",
+  "required": ["name", "steps"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "notify": {
+      "type": "object",
+      "description": "Per-channel notification config. Each channel: {\"on\": [\"start\",\"success\",\"error\",\"retry\"], ...channel-specific fields}.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "on": { "type": "array", "items": { "enum": ["start", "success", "error", "retry"] } },
+          "to": { "type": "string" },
+          "topic": { "type": "string" },
+          "server": { "type": "string" },
+          "token": { "type": "string" },
+          "url": { "type": "string" },
+          "priority": { "type": "integer" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "vars": {
+      "type": "object",
+      "description": "Initial workflow variables. Referenced as ${name} in step params."
+    },
+    "retries": { "type": "integer", "minimum": 0, "default": 0 },
+    "timeout": { "type": "integer", "minimum": 1, "default": 300 },
+    "retry_delay": { "type": "number", "minimum": 0, "default": 5 },
+    "on_error": { "enum": ["fail", "skip", "continue"], "default": "fail" },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "tool"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" },
+          "description": { "type": "string" },
+          "tool": {
+            "enum": [
+              "shell", "read", "write", "append", "list", "web", "research",
+              "email", "notify", "http", "webhook", "set", "expr", "sleep",
+              "delegate", "memory"
+            ]
+          },
+          "params": { "type": "object" },
+          "if": { "type": "string", "description": "Condition (safe expression) gating this step." },
+          "retries": { "type": "integer", "minimum": 0 },
+          "timeout": { "type": "integer", "minimum": 1 },
+          "retry_delay": { "type": "number", "minimum": 0 },
+          "on_error": { "enum": ["fail", "skip", "continue"] }
+        },
+        "additionalProperties": false,
+        "required": ["id", "tool"]
+      }
+    }
+  },
+  "additionalProperties": false
+}

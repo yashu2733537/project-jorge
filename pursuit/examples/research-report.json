@@ -1,0 +1,43 @@
+{
+  "$schema": "../workflow.schema.json",
+  "name": "research-and-email-report",
+  "description": "Research a topic, save a file, then email the findings to a recipient.",
+  "notify": {
+    "ntfy": { "on": ["start", "success", "error"], "topic": "jorge" },
+    "email": { "on": ["success", "error"], "to": "${recipient}" }
+  },
+  "vars": {
+    "recipient": "friend@example.com",
+    "topic": "best free vps 2026"
+  },
+  "retries": 1,
+  "timeout": 300,
+  "on_error": "fail",
+  "steps": [
+    {
+      "id": "research",
+      "tool": "web",
+      "description": "Search the web for the topic",
+      "params": { "query": "${topic}", "n": 5 }
+    },
+    {
+      "id": "save",
+      "tool": "write",
+      "description": "Persist the research to a file",
+      "params": {
+        "path": "/home/eneru/Downloads/research_${topic}.txt",
+        "content": "Research on ${topic}:\n\n${steps.research.output}"
+      }
+    },
+    {
+      "id": "send",
+      "tool": "email",
+      "description": "Email the research summary",
+      "params": {
+        "to": "${recipient}",
+        "subject": "Research: ${topic}",
+        "body": "Here is what I found:\n\n${steps.research.output}"
+      }
+    }
+  ]
+}

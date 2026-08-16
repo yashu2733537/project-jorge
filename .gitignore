@@ -12,6 +12,10 @@ wa_history_*.json
 models_state.json
 self_index.txt
 assistant.py.bak
+plan_state.json
+distill_state.json
+distill.lock
+mistakes.txt
 
 # logs
 *.log

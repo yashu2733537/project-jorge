@@ -32,7 +32,12 @@ from typing import Any
 
 import requests
 
-__version__ = "2.0.0"
+try:
+    import psutil
+except ImportError:  # pragma: no cover
+    psutil = None
+
+__version__ = "2.1.0"
 
 # OpenRouter free model
 DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
@@ -188,20 +193,145 @@ def load_memory() -> list[str]:
         return []
 
 
-def save_memory_entry(text: str) -> None:
+MEMORY_MAX_LINES = 200
+MISTAKES_FILE = SCRIPT_DIR / "mistakes.txt"
+MISTAKES_MAX_LINES = 100
+
+
+def load_mistakes() -> list[str]:
+    if not MISTAKES_FILE.exists():
+        return []
     try:
-        with MEMORY_FILE.open("a", encoding="utf-8") as f:
-            f.write(text.strip() + "\n")
+        return [l.strip() for l in MISTAKES_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except OSError:
+        return []
+
+
+def save_mistake(text: str) -> None:
+    text = text.strip()
+    if not text:
+        return
+    lines = load_mistakes()
+    if lines and lines[-1] == text:
+        return
+    lines.append(text)
+    if len(lines) > MISTAKES_MAX_LINES:
+        lines = lines[-MISTAKES_MAX_LINES:]
+    try:
+        MISTAKES_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as e:
+        print(c("✗ could not write mistakes:", BOLD, RED), e)
+        return
+    print(c("✓ Learned.", BOLD, GREEN), c(f"({len(lines)} lessons total)", GRAY))
+
+
+def save_memory_entry(text: str, replace_similar: bool = False) -> None:
+    text = text.strip()
+    if not text:
+        return
+    lines = load_memory()
+    if lines and lines[-1] == text:
+        return
+    if replace_similar:
+        key = text[:40]
+        new_words = text.split()
+        for i, existing in enumerate(lines):
+            if existing[:40] == key:
+                lines[i] = text
+                break
+            ewords = existing.split()
+            if (
+                len(ewords) >= 2
+                and len(new_words) >= 2
+                and ewords[:2] == new_words[:2]
+                and (existing.startswith(text) or text.startswith(existing))
+            ):
+                lines[i] = text
+                break
+        else:
+            lines.append(text)
+    else:
+        lines.append(text)
+    if len(lines) > MEMORY_MAX_LINES:
+        lines = lines[-MEMORY_MAX_LINES:]
+    try:
+        MEMORY_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except OSError as e:
         print(c("✗ could not write memory:", BOLD, RED), e)
         return
-    print(c("✓ Remembered.", BOLD, GREEN), c(f"({len(load_memory())} notes total)", GRAY))
+    print(c("✓ Remembered.", BOLD, GREEN), c(f"({len(lines)} notes total)", GRAY))
 
 
 def forget_memory() -> None:
     if MEMORY_FILE.exists():
         MEMORY_FILE.unlink()
     print(c("✓ Memory cleared.", BOLD, GREEN))
+
+
+PLAN_STATE_FILE = SCRIPT_DIR / "plan_state.json"
+PLAN_GATED = ("shell", "write", "email", "email_draft", "sort", "organize", "delegate", "skill", "forget")
+DISTILL_SCRIPT = SCRIPT_DIR / "distill.py"
+DISTILL_LOCK = SCRIPT_DIR / "distill.lock"
+
+
+def _spawn_distill() -> None:
+    if not DISTILL_SCRIPT.exists():
+        return
+    if DISTILL_LOCK.exists():
+        try:
+            if time.time() - DISTILL_LOCK.stat().st_mtime < 600:
+                return
+        except OSError:
+            return
+    try:
+        DISTILL_LOCK.write_text(str(os.getpid()), encoding="utf-8")
+        subprocess.Popen(
+            [sys.executable, str(DISTILL_SCRIPT)],
+            cwd=str(SCRIPT_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def _load_plan_state() -> dict[str, Any]:
+    try:
+        return json.loads(PLAN_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"mode": False, "pending": [], "plans": []}
+
+
+def _save_plan_state(state: dict[str, Any]) -> None:
+    try:
+        PLAN_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+    except OSError:
+        LOG.warning("could not save plan state")
+
+
+def _plan_step(tool: dict[str, Any]) -> str | None:
+    a = tool.get("action")
+    if a == "shell":
+        return "run shell: " + str(_normalize_shell_cmd(tool.get("command", "")))[:80]
+    if a == "write":
+        return "write file: " + str(tool.get("path", "?"))
+    if a == "email":
+        return "send email to: " + str(tool.get("to", "?"))
+    if a == "email_draft":
+        return "draft and send email to: " + str(tool.get("to", "?"))
+    if a in ("sort", "organize"):
+        return "organize files in: " + str(tool.get("path", "?"))
+    if a == "delegate":
+        return "hand task to opencode (senior dev): " + str(tool.get("task", ""))[:60]
+    if a == "skill":
+        propose = tool.get("propose", [])
+        names = ", ".join(s.get("name", "?") if isinstance(s, dict) else str(s) for s in propose[:5])
+        return "build skills: " + names
+    if a == "forget":
+        return "clear stored memory notes"
+    return None
 
 
 def append_conversation(entry: dict[str, Any]) -> None:
@@ -444,13 +574,16 @@ def _ddg_html(query: str, limit: int) -> list[dict[str, str]]:
 
 
 def web_search(query: str, n: int = 8) -> list[dict[str, str]]:
-    for fetcher in (_ddg_lite, _ddg_html):
-        try:
-            results = fetcher(query, n)
-            if results:
-                return results
-        except (requests.RequestException, ValueError):
-            LOG.debug("search backend %s failed", fetcher.__name__)
+    for attempt in range(2):
+        for fetcher in (_ddg_lite, _ddg_html):
+            try:
+                results = fetcher(query, n)
+                if results:
+                    return results
+            except (requests.RequestException, ValueError):
+                LOG.debug("search backend %s failed", fetcher.__name__)
+        if attempt == 0:
+            time.sleep(1.5)
     return []
 
 
@@ -494,6 +627,20 @@ def cmd_web(args: argparse.Namespace, env: dict[str, str]) -> None:
     print()
 
 
+def cmd_music(args: argparse.Namespace, env: dict[str, str]) -> None:
+    print(BANNER)
+    print(c("  🎵 searching: ", GRAY) + c(args.query, BOLD) + c("  (Spotify)", DIM) + "\n")
+    results = web_search(f"site:open.spotify.com {args.query}")
+    spotify = next((r["url"] for r in results if "open.spotify.com" in r["url"]), None)
+    if not spotify:
+        print(c("  ✗ no Spotify link found", GRAY))
+        print()
+        return
+    print(c("  Spotify link:", CYAN))
+    box(spotify, GREEN)
+    print()
+
+
 # ---------------- MEMORY COMMANDS ----------------
 
 def cmd_remember(args: argparse.Namespace, env: dict[str, str]) -> None:
@@ -527,6 +674,458 @@ def cmd_forget(args: argparse.Namespace, env: dict[str, str]) -> None:
     print()
 
 
+# ---------------- FILE ORGANIZATION (patterns) ----------------
+
+PATTERN_RULES: dict[str, str] = {
+    r"^IMG[_\- ]?\d+": "Phone_Photos",
+    r"^Screenshot[_\- ]?\d*": "Screenshots",
+    r"^WhatsApp(?: Image| Video)?[_\- ]?\d*": "WhatsApp_Media",
+    r"^resume|^cv\b|^cover[_\- ]?letter": "Job_Search",
+    r"invoice|receipt|bill|statement": "Finances",
+    r"tax|_202\d|_20\d\d": "Taxes",
+    r"report|meeting[_\- ]?notes|notes": "Work_Docs",
+    r"backup|\.bak$|_old|copy\b": "Backups",
+    r"^flac_": "Flac_Album",
+}
+
+
+def pattern_category_for(filename: str) -> str:
+    name = Path(filename).name
+    for rule, cat in PATTERN_RULES.items():
+        if re.search(rule, name, re.I):
+            return cat
+    return category_for(filename)
+
+
+def cmd_organize(args: argparse.Namespace, env: dict[str, str] | None = None) -> None:
+    print(BANNER)
+    folder = Path(args.path)
+    if not folder.is_dir():
+        print(c("✗ Not a directory:", BOLD, RED), folder)
+        sys.exit(1)
+    plan = {
+        f: pattern_category_for(f.name)
+        for f in sorted(folder.iterdir())
+        if f.is_file() and not f.name.startswith(".")
+    }
+    if not plan:
+        print(c("  no files to organize", GRAY))
+        return
+    header(f"Organizing {len(plan)} files in {folder} (type + naming patterns)")
+    for f, cat in plan.items():
+        pad = 36 - len(f.name)
+        print(c(f"  {f.name}", GRAY) + c(" " * max(pad, 1) + "→", CYAN) + c(f" {cat}/", BOLD, GREEN))
+    if args.dry_run:
+        print(c("  (dry run — nothing moved)", DIM))
+        return
+    answer = _safe_input(c("  proceed? ", CYAN) + c("[y/N] > ", GRAY), default="n").lower()
+    if answer not in ("y", "yes"):
+        print(c("  ✗ cancelled", GRAY))
+        return
+    for f, cat in plan.items():
+        dest = folder / cat
+        dest.mkdir(exist_ok=True)
+        target = dest / f.name
+        if target.exists():
+            stem, ext = os.path.splitext(f.name)
+            i = 1
+            while target.exists():
+                target = dest / f"{stem}_{i}{ext}"
+                i += 1
+        shutil.move(str(f), str(target))
+        print(c(f"  ✓ {f.name} -> {cat}/", GREEN))
+    print(c("  done.", BOLD, GREEN) + "\n")
+
+
+# ---------------- WEB RESEARCH (citations) ----------------
+
+def web_research(query: str, n: int = 8) -> list[dict[str, str]]:
+    return web_search(query, n)
+
+
+def deep_research(query: str, min_docs: int = 5) -> list[dict[str, str]]:
+    queries = [query]
+    env = load_env()
+    if env.get("AI_API_KEY"):
+        try:
+            raw, _u, _m = chat_call(
+                env,
+                [
+                    {"role": "system", "content": "Return a JSON array of 3-4 short web search queries (strings) that together thoroughly cover the user's topic from different angles. Only the array, no other text."},
+                    {"role": "user", "content": query},
+                ],
+                max_tokens=120,
+            )
+            extra = json.loads(raw.strip())
+            if isinstance(extra, list):
+                queries += [str(q).strip()[:120] for q in extra if isinstance(q, str) and q.strip()][:3]
+        except Exception:
+            pass
+
+    seen: dict[str, dict[str, str]] = {}
+
+    def collect(q: str) -> None:
+        for res in web_search(q, 6):
+            url = re.sub(r"#.*$", "", res.get("url", "")).rstrip("/")
+            if url and url not in seen:
+                seen[url] = {"title": res.get("title", ""), "url": res.get("url", ""), "snippet": res.get("snippet", "")}
+
+    for q in queries:
+        if len(seen) >= min_docs:
+            break
+        collect(q)
+    for suffix in ("sources", "guide", "explain", "examples"):
+        if len(seen) >= min_docs:
+            break
+        collect(f"{query} {suffix}")
+    if PRICE_RE.search(query):
+        collect(f"{query} price India INR")
+    return list(seen.values())[: min_docs + 3]
+
+
+RESEARCH_EXEMPT = re.compile(
+    r"\b(?:jorge|yourself|your name|your code|what can you|who are you|"
+    r"remember|memory|forget|plan mode|abort|stop|cancel)\b",
+    re.I,
+)
+
+PRICE_RE = re.compile(r"\b(?:price|prices|pricing|cost|costs|how much|worth|rupees?|\brs\.?|bucks|₹|\$)\b", re.I)
+
+
+GARBLE_PREFIXES = (
+    "here's a thinking", "let me think", "i need to think", "1. **analyze",
+    "the user is asking", "i need to provide", "the instruction says", "i should",
+    "based on the information given", "let me provide", "i don't have exact",
+)
+
+
+def _clean_answer(text: str) -> bool:
+    return bool(text) and not text.lower().startswith(GARBLE_PREFIXES)
+
+
+def _source_fallback(docs: list[dict[str, str]], header: str) -> str:
+    lines = []
+    for i, d in enumerate(docs[:5], 1):
+        snippet = (d.get("snippet") or "").strip()[:200]
+        lines.append(f"{i}. {d.get('title', '?')}" + (f" — {snippet}" if snippet else ""))
+    return header + "\n" + "\n".join(lines)
+
+
+def _price_note(question: str) -> str:
+    if PRICE_RE.search(question):
+        return (
+            " The question asks about PRICE/COST: your answer MUST state the current price "
+            "or price range as the FIRST thing, with the date it refers to (and in INR/₹ if India-relevant)."
+        )
+    return ""
+
+
+def _reply_is_garbage(reply: str) -> bool:
+    r = reply.strip()
+    first = r.splitlines()[0].lower() if r else ""
+    if first.startswith(("no results found", "search returned nothing")):
+        return True
+    if r.startswith("{") and '"action"' in r[:120]:
+        return True
+    return len(r) < 40 and r.lower().startswith(("i searched", "i looked", "done", "ok", "no results"))
+
+
+def _wants_research(line: str) -> bool:
+    low = re.sub(r"^(?:ok|okay|sure|hmm|um|so|yo|hey)\s*[,!.]*\s*", "", line.strip().lower())
+    if len(low) < 6:
+        return False
+    if RESEARCH_EXEMPT.search(low):
+        return False
+    if re.match(r"^(?:hi|hello|hey|yo|thanks|thank you|ok|okay|sure|yes|no|bye)\s*[.!]?$", low):
+        return False
+    if low.rstrip().endswith("?"):
+        return True
+    return bool(
+        re.match(
+            r"^(?:whats?|hows?|whys?|whos?|whens?|wheres?|whichs?|is|are|do|does|can|could|"
+            r"should|would|will|tell me|explain|plan|research|look up|find|search|"
+            r"best|top|compare|recommend|give me)\b",
+            low,
+        )
+    )
+
+
+def format_research_cited(results: list[dict[str, str]]) -> str:
+    lines = []
+    for i, r in enumerate(results, 1):
+        lines.append(f"[{i}] {r['title']}")
+        lines.append(f"    Source: {r['url']}")
+        if r.get("snippet"):
+            lines.append(f"    {r['snippet'][:180]}")
+    return "\n".join(lines)
+
+
+def cmd_research(args: argparse.Namespace, env: dict[str, str]) -> None:
+    print(BANNER)
+    print(c("  🔍 researching: ", GRAY) + c(args.query, BOLD) + c("  (DuckDuckGo, cited)", DIM) + "\n")
+    results = web_research(args.query, args.limit)
+    if not results:
+        print(c("  ✗ no results found", GRAY))
+        return
+    print(format_research_cited(results))
+    if args.ask:
+        if not env.get("AI_API_KEY"):
+            print(c("✗ AI_API_KEY missing in .env — can't summarize.", BOLD, RED))
+            return
+        text = "\n".join(f"[{i}] {r['title']}: {r['url']} — {r['snippet']}" for i, r in enumerate(results, 1))
+        try:
+            answer, usage, model = api_call(
+                env,
+                {
+                    "messages": [
+                        {"role": "system", "content": "Summarize the findings for the user's question. Cite sources by their [n] number. Be concise but complete."},
+                        {"role": "user", "content": f"Question: {args.query}\n\nSearch results:\n{text}"},
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 500,
+                },
+                json_mode=False,
+            )
+        except RuntimeError as e:
+            print(c("  ✗ AI summary failed: ", RED) + str(e))
+            print()
+            return
+        print(c("  ── AI SUMMARY (with citations) ──", CYAN) + tokens_str(usage, model))
+        box(answer, GREEN)
+    print()
+
+
+# ---------------- EMAIL DRAFTING (tone + context) ----------------
+
+EMAIL_TONES = {"professional", "friendly", "casual", "formal", "warm", "direct", "urgent"}
+
+EMAIL_TONE_GUIDE = {
+    "professional": "Clear, courteous, well-structured, standard business tone. Use complete sentences and avoid slang.",
+    "friendly": "Approachable and personable while staying professional. Warm greetings, light touch.",
+    "casual": "Relaxed, conversational, like texting a close colleague. Can use contractions and informality.",
+    "formal": "Highly polished and respectful. Formal salutations, no contractions, deferential language.",
+    "warm": "Kind and encouraging, relationship-focused, genuinely interested in the recipient.",
+    "direct": "Brief and to-the-point. Few pleasantries, straight to the ask, still polite.",
+    "urgent": "Clear about time-sensitivity. Flags the deadline and why it matters, while staying professional.",
+}
+
+
+def _recent_context() -> str:
+    entries = []
+    try:
+        lines = CONV_LOG.read_text(encoding="utf-8").splitlines()[-12:]
+    except OSError:
+        return ""
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        role = entry.get("role", "")
+        content = (entry.get("content") or "")[:400]
+        if role in ("user", "assistant") and content:
+            entries.append(f"{role}: {content}")
+    return "\n".join(entries)
+
+
+def cmd_email_draft(args: argparse.Namespace, env: dict[str, str]) -> None:
+    print(BANNER)
+    if not env.get("AI_API_KEY"):
+        print(c("✗ AI_API_KEY missing in .env.", BOLD, RED))
+        sys.exit(1)
+    tone = (args.tone or "professional").lower()
+    if tone not in EMAIL_TONES:
+        print(c(f"✗ unknown tone '{tone}'. choose: {', '.join(sorted(EMAIL_TONES))}", BOLD, RED))
+        return
+    header(f"Drafting {tone} email to {args.to}")
+    print(c("  ✉ subject: ", GRAY) + c(args.subject or "(AI-generated)", BOLD))
+    guide = EMAIL_TONE_GUIDE.get(tone, EMAIL_TONE_GUIDE["professional"])
+    context = args.context or ""
+    if args.recall:
+        context = (context + "\n" if context else "") + "Relevant recent conversation:\n" + _recent_context()
+    try:
+        body, usage, model = api_call(
+            env,
+            {
+                "messages": [
+                    {"role": "system", "content": "You are a skilled email writer. Write only the email body (no subject line, no salutation wrapper unless requested)."},
+                    {"role": "user", "content": f"Recipient: {args.to}\nTone: {tone} ({guide})\nSubject: {args.subject or '(create one suggestion inside the body as a first line)'}\n"
+                                              f"Content to convey: {args.topic}\n\nAdditional context to weave in naturally: {context or '(none)'}"},
+                ],
+                "temperature": 0.6,
+                "max_tokens": 600,
+            },
+            json_mode=False,
+        )
+    except RuntimeError as e:
+        print(c("  ✗ AI draft failed: ", RED) + str(e))
+        return
+    print(c("  ── DRAFT ──", CYAN) + tokens_str(usage, model))
+    box(body, GREEN)
+    if not args.no_send:
+        if confirm_action(f"send this {tone} email to {args.to}"):
+            send_email(env, args.to, args.subject or "(no subject)", body)
+            print(c("  ✓ Sent to ", BOLD, GREEN) + c(args.to, BOLD) + "\n")
+        else:
+            print(c("  draft saved locally only — use: jorge email to send later", GRAY))
+            print()
+
+
+# ---------------- SYSTEM MONITORING ----------------
+
+def fmt_bytes(n: float) -> str:
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024 or unit == "T":
+            return f"{n:.1f}{unit}" if unit != "B" else f"{int(n)}B"
+        n /= 1024
+    return f"{n:.1f}T"
+
+
+def collect_system_stats() -> dict[str, Any]:
+    stats: dict[str, Any] = {}
+    if psutil is None:
+        return stats
+    vm = psutil.virtual_memory()
+    stats["cpu_percent"] = psutil.cpu_percent(interval=0.2)
+    stats["mem_percent"] = vm.percent
+    stats["mem_used"] = vm.used
+    stats["mem_total"] = vm.total
+    du = shutil.disk_usage(Path.home())
+    stats["disk_percent"] = round(du.used / du.total * 100, 1)
+    stats["disk_used"] = du.used
+    stats["disk_total"] = du.total
+    stats["loadavg"] = [round(x, 2) for x in os.getloadavg()]
+    stats["procs"] = len(psutil.pids())
+    return stats
+
+
+def top_processes(n: int = 5) -> list[dict[str, Any]]:
+    if psutil is None:
+        return []
+    procs = []
+    for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
+        try:
+            procs.append(p.info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    procs.sort(key=lambda x: (x.get("cpu_percent") or 0) + (x.get("memory_percent") or 0), reverse=True)
+    return procs[:n]
+
+
+def _fmt_stats(stats: dict[str, Any]) -> str:
+    lines = [
+        f"CPU: {stats.get('cpu_percent', '?')}%",
+        f"Memory: {fmt_bytes(stats.get('mem_used', 0))} / {fmt_bytes(stats.get('mem_total', 0))} ({stats.get('mem_percent', '?')}%)",
+        f"Disk (~): {fmt_bytes(stats.get('disk_used', 0))} / {fmt_bytes(stats.get('disk_total', 0))} ({stats.get('disk_percent', '?')}%)",
+        f"Load average: {stats.get('loadavg', '?')}",
+        f"Processes: {stats.get('procs', '?')}",
+    ]
+    return "\n".join(lines)
+
+
+def check_alerts(thresholds: dict[str, float]) -> list[str]:
+    alerts = []
+    stats = collect_system_stats()
+    if not stats:
+        return ["(system monitoring unavailable — psutil not installed)"]
+    if stats.get("cpu_percent", 0) >= thresholds.get("cpu", 90):
+        alerts.append(f"⚠ CPU at {stats['cpu_percent']}% (threshold {thresholds['cpu']}%)")
+    if stats.get("mem_percent", 0) >= thresholds.get("mem", 85):
+        alerts.append(f"⚠ Memory at {stats['mem_percent']}% (threshold {thresholds['mem']}%)")
+    if stats.get("disk_percent", 0) >= thresholds.get("disk", 90):
+        alerts.append(f"⚠ Disk at {stats['disk_percent']}% (threshold {thresholds['disk']}%)")
+    if not alerts:
+        alerts.append("✓ All systems within normal thresholds.")
+    return alerts
+
+
+def cmd_monitor(args: argparse.Namespace, env: dict[str, str] | None = None) -> None:
+    print(BANNER)
+    if psutil is None:
+        print(c("✗ psutil not installed — run: pip install psutil", BOLD, RED))
+        return
+    header("System monitoring")
+    stats = collect_system_stats()
+    print(c("  " + _fmt_stats(stats).replace("\n", "\n  "), GRAY) + "\n")
+    header("Top processes (cpu + memory)")
+    for p in top_processes(args.top):
+        print(c(f"  {p.get('name', '?')}", BOLD) + c(f"  pid={p.get('pid')}", DIM) +
+              c(f"  cpu={round(p.get('cpu_percent') or 0, 1)}%  mem={round(p.get('memory_percent') or 0, 1)}%", GRAY))
+    print()
+    thresholds = {"cpu": args.cpu, "mem": args.mem, "disk": args.disk}
+    print(c("  thresholds: ", GRAY) + c(f"cpu>{args.cpu}%  mem>{args.mem}%  disk>{args.disk}%", DIM))
+    for a in check_alerts(thresholds):
+        color = RED if a.startswith("⚠") else GREEN
+        print(c("  " + a, color))
+    print()
+
+
+# ---------------- TASK DELEGATION (breakdown) ----------------
+
+def break_down_task(task: str, max_steps: int = 5) -> list[str]:
+    steps = []
+    lines = [l.strip(" -•\t") for l in task.splitlines() if l.strip()]
+    if not lines:
+        return []
+    if len(lines) >= 2:
+        for l in lines[:max_steps]:
+            if not l.lower().startswith(("step", "then", "next", "finally", "first", "second", "third")):
+                steps.append(l)
+            else:
+                steps.append(l)
+        return steps[:max_steps]
+    words = re.findall(r"[a-zA-Z]+", task)
+    keywords = [w for w in words if w.lower() in (
+        "install", "installing", "setup", "set", "create", "creating", "build", "building", "write", "writing",
+        "test", "tests", "testing", "refactor", "fix", "fixing", "configure", "configuring", "update",
+        "deploy", "deploying", "debug", "review", "document", "rename", "move", "add", "remove", "send",
+    )]
+    if keywords:
+        positions = []
+        for k in keywords:
+            m = re.search(r"\b" + re.escape(k) + r"\b", task, re.I)
+            if m:
+                positions.append((m.start(), k))
+        positions.sort()
+        seen: set[str] = set()
+        unique: list[tuple[int, str]] = []
+        for pos, k in positions:
+            if k.lower() not in seen:
+                seen.add(k.lower())
+                unique.append((pos, k))
+        for i, (pos, k) in enumerate(unique[:max_steps]):
+            start = pos
+            if i + 1 < len(unique):
+                end = unique[i + 1][0]
+            else:
+                end = len(task)
+            step = task[start:end].strip().rstrip(",;").strip()[:160]
+            steps.append(step or k)
+    if not steps:
+        steps = [task[:160]] * 1
+    return steps[:max_steps]
+
+
+def cmd_delegate_breakdown(args: argparse.Namespace, env: dict[str, str]) -> None:
+    print(BANNER)
+    task = args.task
+    header("Task breakdown")
+    steps = break_down_task(task, args.steps)
+    for i, s in enumerate(steps, 1):
+        print(c(f"  {i}. ", CYAN) + c(s, BOLD))
+    print()
+    if not args.dry_run and env.get("AI_API_KEY"):
+        if confirm_action("hand the full task to opencode (senior dev)") or BOT_MODE:
+            emit_progress("⚡ Delegating full task to my senior dev (opencode)...")
+            out = run_delegate(task, args.dir or "")
+            print(c("  ── RESULT ──", CYAN))
+            print(c(_keep_tail_summary(summarize_delegate(out)), GRAY))
+    print()
+
+
 # ---------------- CHAT / MODEL ----------------
 
 CHAT_SYSTEM = """You are jorge, a friendly personal assistant in a terminal with FULL access to the user's computer.
@@ -548,11 +1147,20 @@ You must reply with ONLY one JSON object, no markdown fences, no extra text, no 
 {"action": "self", "task": "status|view|edit|debug", "edits": [{"old": "...", "new": "..."}], "replace": "optional full new file source"}
 {"action": "delegate", "task": "the full task to hand to opencode", "dir": "optional working folder"}
 {"action": "skill", "propose": [{"name": "skill-name", "purpose": "one line"}]}
+{"action": "organize", "path": "/folder/path"}
+{"action": "research", "query": "complex question", "n": 8}
+{"action": "email_draft", "to": "recipient@example.com", "subject": "...", "topic": "what it should say", "tone": "professional|friendly|casual|formal|warm|direct|urgent", "context": "optional extra context", "recall": true}
+{"action": "monitor", "top": 5, "cpu": 90, "mem": 85, "disk": 90}
+{"action": "delegate_breakdown", "task": "the complex task", "dir": "optional folder", "steps": 5}
 
 Rules:
 - If the user asks to email/send a message -> action email. Extract recipient, subject, and the content/topic. Use "" if unknown.
-- If the user asks to search/check something online -> action web.
-- If the user asks to organize/sort files -> action sort.
+- If the user asks to search/check something online -> action web. If the user wants a deeper, cited research summary of a complex question -> action research.
+- RESEARCH FIRST: if the user asks a question or asks you to plan something, search the web first (action web or action research, multiple targeted queries) and read at least 5 sources before answering. Base your answer on those sources and cite a couple of them. Skip research only for questions about the user/jorge itself, memory notes, or small talk.
+- If the user asks to organize/sort files -> action sort (basic by type) or action organize (by type AND naming patterns like IMG_, Screenshot, invoice, resume, etc).
+- If the user asks to draft an email with a specific tone (professional/friendly/casual/formal/warm/direct/urgent) or wants a draft they can review before sending -> action email_draft.
+- If the user asks to check system resources, CPU/memory/disk usage, running processes, or wants alerts on thresholds -> action monitor.
+- If the user asks to plan/break down a complex multi-step task into sub-tasks (then delegate them) -> action delegate_breakdown.
 - If the user says remember/note that -> action remember.
 - If the user asks to run a command, install something, check system info, create/edit code files, inspect files or folders -> use shell/read/write/list. Break big tasks into small steps (one action per reply).
 - DELEGATE RULE: You are the DISPATCHER for coding/building work. If the task involves writing code, building a feature/project, fixing bugs, refactoring, scripting, game development, or anything a senior developer would do -> action delegate with the user's request as "task". Never attempt complex coding yourself. Small terminal commands (ls, checking info, simple one-liners) are fine as shell.
@@ -743,20 +1351,77 @@ def confirm_action(description: str, danger: bool = False) -> bool:
     return answer in ("y", "yes")
 
 
+_RAR_RUN_RE = re.compile(r"^(?:unrar|7z|7za|7zz|7zr|bsdtar)\s+([xelt])\b")
+_EXE_RUN_RE = re.compile(r"(?<![\w.\-/])(?:\./)?[\w.][\w. -]*?\.exe(?:\.[a-z]+)?\b", re.I)
+_EXE_SAFE_CMDS = re.compile(
+    r"^\s*(?:ls|find|file|cat|head|tail|grep|echo|which|type|rm|cp|mv|stat|du|wc|strings|winecfg|wineboot)\b",
+    re.I,
+)
+
+
+def _normalize_shell_cmd(cmd: str) -> str:
+    low = cmd.strip()
+    m = _RAR_RUN_RE.search(low)
+    if m:
+        mode, rest = m.group(1), low[m.end():].strip()
+        om = re.search(r'-o"?([^"\s]+)"?', rest)
+        if om:
+            outdir = om.group(1)
+            rest = re.sub(r'-o"?[^"\s]+"?\s*', "", rest).strip()
+            return f"rar {mode} {rest} {outdir}"
+        return f"rar {mode} {rest}"
+    if _EXE_RUN_RE.search(low) and not _EXE_SAFE_CMDS.match(low) and "wine" not in low:
+        mcd = re.match(r"^(\s*cd\s+[^;&]+&&\s*)(.*)$", low)
+        if mcd:
+            return mcd.group(1) + "wine " + mcd.group(2)
+        return "wine " + low
+    return cmd
+
+
 def run_shell(command: str, timeout: int = 120) -> str:
     r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
-    out = (r.stdout or "") + (r.stderr or "")
     if len(out) > MAX_TOOL_REPLY:
         out = out[:MAX_TOOL_REPLY] + "\n...[truncated]"
-    return out.strip() or "(no output, exit code " + str(r.returncode) + ")"
+    out = out.strip() or "(no output)"
+    failed = r.returncode != 0 or _output_has_errors(out)
+    return ("✗ FAILED (exit %s): %s" % (r.returncode, out)) if failed else ("✓ " + out)
+
+
+def _keep_tail_summary(out: str) -> str:
+    out = out.strip()
+    if len(out) <= MAX_TOOL_REPLY or "SUMMARY:" not in out:
+        return out[:MAX_TOOL_REPLY] or ""
+    keep = out[:MAX_TOOL_REPLY]
+    pos = out.rfind("SUMMARY:")
+    if pos > MAX_TOOL_REPLY:
+        keep += "\n…\n" + _clip(out[pos:], limit=800)
+    return keep
+
+
+_ERROR_MARKERS = (
+    "command not found", "no such file or directory", "permission denied",
+    "unsupported method", "cannot open", "wrong password", "corrupt",
+)
+
+
+def _output_has_errors(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _ERROR_MARKERS)
+
+
+def _delegate_blocked(task: str, dir_arg: str) -> bool:
+    scrub = re.sub(r"(?:don'?t|do\s+not)\s+touch[^.]*?(?:godot|game)[^.]*\.", "", task, flags=re.I)
+    low = scrub.lower()
+    blocked = [w for w in ("my-game-my-legacy-2", ".tscn", "win_screen", "boss fight", "boss_fight") if w in low]
+    if re.search(r"\b(?:my|our)\s+(?:godot\s+)?game\b", low):
+        blocked.append("my/our game")
+    if dir_arg and "my-game-my-legacy-2" in dir_arg:
+        blocked.append("game dir")
+    return bool(blocked)
 
 
 def run_delegate(task: str, dir_arg: str) -> str:
-    scrub = re.sub(r"don'?t\s+touch[^.]*?(?:godot|game)[^.]*\.", "", task, flags=re.I)
-    blocked = [w for w in ("my-game-my-legacy-2", ".tscn", "win_screen", "boss fight", "boss_fight", "godot") if w in scrub.lower()]
-    if dir_arg and "my-game-my-legacy-2" in dir_arg:
-        blocked.append("game dir")
-    if blocked:
+    if _delegate_blocked(task, dir_arg):
         return "Can't delegate that — the game project (Godot) is off-limits per the boss."
     workdir = Path(os.path.expanduser(dir_arg)) if dir_arg else Path.home()
     emit_progress("⚡ On it — handing this to my senior dev (opencode). Give me a few minutes...")
@@ -770,7 +1435,7 @@ def run_delegate(task: str, dir_arg: str) -> str:
                 break
     if not binary:
         return "opencode CLI not found — install opencode or put it in your PATH."
-    cmd = [binary, "run", task + "\n\nAfter finishing, reply with a short plain-text summary (2-3 sentences, no code) of what you changed and how to use it, prefixed with SUMMARY:"]
+    cmd = [binary, "run", task + "\n\nIMPORTANT: When you finish, your final message MUST end with a line that starts with 'SUMMARY:' followed by a 2-3 sentence plain-text summary of what you changed and how to use it. The SUMMARY: line is the most important part — always include it even if everything else is short."]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, cwd=str(workdir), env=env2, timeout=900)
     except subprocess.TimeoutExpired:
@@ -778,7 +1443,18 @@ def run_delegate(task: str, dir_arg: str) -> str:
     out = (r.stdout or "") + (r.stderr or "")
     if r.returncode != 0 and not out.strip():
         return f"opencode failed (exit {r.returncode})."
-    return out.strip()[:MAX_TOOL_REPLY] or "(opencode returned nothing)"
+    return _keep_tail_summary(out) or "(opencode returned nothing)"
+
+
+def _clip(text: str, limit: int = 600) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    sp = cut.rfind(" ")
+    if sp > limit // 2:
+        cut = cut[:sp]
+    return cut.rstrip(",.;: ") + "…"
 
 
 def summarize_delegate(out: str) -> str:
@@ -796,39 +1472,72 @@ def summarize_delegate(out: str) -> str:
                 break
             keep.append(l)
         if keep:
-            return "\n".join(keep)[:600]
+            return _clip("\n".join(keep))
     junk = re.compile(r"^(?:\+{1,}|-{1,}|@@|diff |index |---|\+\+\+|◆|\$|→|> )")
     clean = [l.strip() for l in text.split("\n") if l.strip() and not junk.match(l)]
     if clean:
         joined = "\n".join(clean)
         if len(joined) <= 600:
             return joined
-        return "Done. " + "\n".join(clean[-3:])[:600]
-    return text[:600]
+        tail = clean[-3:]
+        while tail and not re.search(r"[.!?…]\s*$", tail[-1]):
+            tail.pop()
+        if not tail:
+            tail = clean[-1:]
+        return "Done. " + _clip("\n".join(tail))
+    return _clip(text)
 
 
 def run_tool(env: dict[str, str], tool: dict[str, Any], history: list[dict[str, str]]) -> tuple[str, bool]:
     action = tool.get("action")
     if action == "chat":
-        return tool.get("reply", "").strip(), True
+        reply = str(tool.get("reply", "")).strip()
+        if reply.startswith("{") and '"action"' in reply[:120]:
+            try:
+                inner = json.loads(reply)
+                if isinstance(inner, dict) and inner.get("action") == "chat":
+                    reply = str(inner.get("reply", "")).strip()
+            except Exception:
+                pass
+        return reply, True
     if action == "web":
         query = tool.get("query", "").strip()
         if not query:
             query = ask_bot("what should I search for")
         results = web_search(query, 5)
         if not results:
-            return "No results found.", True
+            return "⚠ Search returned nothing right now (backend may be rate-limited). Ask again in a minute.", True
         for i, res in enumerate(results, 1):
             print(c(f"  {i:>2}. ", CYAN) + c(res["title"], BOLD))
             print(c("      " + res["url"], DIM))
-        answer, usage, model = chat_call(env, [
-            {"role": "system", "content": "Summarize the search results to answer the question concisely."},
-            {"role": "user", "content": f"Question: {query}\n\nResults:\n" + "\n".join(f"- {r['title']}: {r['snippet']}" for r in results)},
-        ], max_tokens=300)
+        answer = ""
+        for _attempt in range(2):
+            answer, usage, model = api_call(env, {
+                "messages": [
+                    {"role": "system", "content": "Summarize the search results to answer the question concisely in plain text. Answer directly — no thinking process, no meta-commentary about the sources." + _price_note(query)},
+                    {"role": "user", "content": f"Question: {query}\n\nResults:\n" + "\n".join(f"- {r['title']}: {r['snippet']}" for r in results)},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 300,
+            }, json_mode=False)
+            ans = (answer or "").strip()
+            if _clean_answer(ans):
+                break
         print(c("  ── ANSWER ──", CYAN))
         box(answer, GREEN)
         print(tokens_str(usage, model))
-        return "", True
+        ans = (answer or "").strip()
+        if not _clean_answer(ans):
+            ans = _source_fallback(results, "The summary model glitched — here's what the sources say:")
+        if ans.startswith("{") and '"' in ans[:120]:
+            try:
+                j = json.loads(ans)
+                if isinstance(j, dict):
+                    ans = str(j.get("reply") or j.get("answer") or j.get("content") or ans).strip()
+            except Exception:
+                pass
+        srcs = "\n".join(f"{i}. {r['title']} — {r['url']}" for i, r in enumerate(results[:5], 1))
+        return (ans or "No results found.") + "\n\nSources:\n" + srcs, True
     if action == "email":
         to = tool.get("to", "").strip()
         subject = tool.get("subject", "").strip()
@@ -865,7 +1574,7 @@ def run_tool(env: dict[str, str], tool: dict[str, Any], history: list[dict[str, 
         forget_memory()
         return "Memory cleared.", True
     if action == "shell":
-        command = tool.get("command", "").strip()
+        command = _normalize_shell_cmd(tool.get("command", "").strip())
         if not command:
             return "No command given.", False
         print(c("  $ ", CYAN) + c(command, BOLD))
@@ -935,8 +1644,6 @@ def run_tool(env: dict[str, str], tool: dict[str, Any], history: list[dict[str, 
                     lines.append(f"{i}. {s}")
             text = "Skills I want to build for myself:\n" + "\n".join(lines)
             emit_progress("⚡ Proposing new skills for myself...")
-            if not BOT_MODE:
-                return text, True
             build_text = (
                 "Create opencode skills. For each skill: create a folder "
                 "~/.config/opencode/skills/<name>/ with a SKILL.md (frontmatter: name and description; "
@@ -950,6 +1657,122 @@ def run_tool(env: dict[str, str], tool: dict[str, Any], history: list[dict[str, 
             emit_progress("⚡ Building them now — delegating to opencode...")
             return summarize_delegate(run_delegate(build_text, "")), True
         return "Say 'build yourself new skills' and I'll propose specific ones.", True
+    if action == "organize":
+        path = tool.get("path", "").strip()
+        if not path:
+            path = ask_bot("which folder")
+        cmd_organize(argparse.Namespace(path=os.path.expanduser(path), dry_run=False), env)
+        return "", True
+    if action == "research":
+        query = tool.get("query", "").strip()
+        if not query:
+            query = ask_bot("what should I research")
+        n = int(tool.get("n", 8) or 8)
+        results = web_research(query, n)
+        if not results:
+            return "⚠ Search returned nothing right now (backend may be rate-limited). Ask again in a minute.", True
+        for i, res in enumerate(results, 1):
+            print(c(f"  [{i}] ", CYAN) + c(res["title"], BOLD))
+            print(c("      Source: " + res["url"], DIM))
+            if res.get("snippet"):
+                print(c("      " + res["snippet"][:150], GRAY))
+        answer = ""
+        for _attempt in range(2):
+            answer, usage, model = api_call(env, {
+                "messages": [
+                    {"role": "system", "content": "Summarize the findings to answer the question. Cite sources by their [n] number from the results. Answer directly — no thinking process, no meta-commentary." + _price_note(query)},
+                    {"role": "user", "content": f"Question: {query}\n\nResults:\n" + "\n".join(f"[{i}] {r['title']}: {r['url']} — {r['snippet']}" for i, r in enumerate(results, 1))},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 400,
+            }, json_mode=False)
+            ans = (answer or "").strip()
+            if _clean_answer(ans):
+                break
+        print(c("  ── SUMMARY (cited) ──", CYAN))
+        box(answer, GREEN)
+        print(tokens_str(usage, model))
+        ans = (answer or "").strip()
+        if not _clean_answer(ans):
+            ans = _source_fallback(results, "The summary model glitched — here's what the sources say:")
+        srcs = "\n".join(f"{i}. {r['title']} — {r['url']}" for i, r in enumerate(results[:5], 1))
+        return (ans or "No results found.") + "\n\nSources:\n" + srcs, True
+    if action == "email_draft":
+        to = tool.get("to", "").strip()
+        subject = tool.get("subject", "").strip()
+        topic = tool.get("topic", "").strip()
+        tone = tool.get("tone") or "professional"
+        if not to:
+            to = ask_bot("who is it to")
+        if not topic:
+            topic = ask_bot("what should the email say")
+        if not to or not topic:
+            return "Email draft cancelled — missing details.", True
+        context = tool.get("context") or ""
+        recall = bool(tool.get("recall"))
+        if recall:
+            context = (context + "\n" if context else "") + "Relevant recent conversation:\n" + _recent_context()
+        if tone not in EMAIL_TONES:
+            tone = "professional"
+        try:
+            guide = EMAIL_TONE_GUIDE[tone]
+            body, usage, model = api_call(
+                env,
+                {
+                    "messages": [
+                        {"role": "system", "content": "You are a skilled email writer. Write only the email body."},
+                        {"role": "user", "content": f"Recipient: {to}\nTone: {tone} ({guide})\nSubject: {subject or '(suggest one)'}\nContent: {topic}\n\nContext: {context or '(none)'}"},
+                    ],
+                    "temperature": 0.6,
+                    "max_tokens": 600,
+                },
+                json_mode=False,
+            )
+        except RuntimeError as e:
+            return f"Email draft failed: {e}", True
+        print(c("  ── DRAFT ──", CYAN) + tokens_str(usage, model))
+        box(body, GREEN)
+        if confirm_action(f"send this {tone} email to {to}"):
+            send_email(env, to, subject or "(no subject)", body)
+            return f"Sent {tone} email to {to}.", True
+        return f"Here's the {tone} draft (not sent): {body[:300]}", True
+    if action == "monitor":
+        try:
+            top = int(tool.get("top", 5) or 5)
+            cpu = float(tool.get("cpu", 90) or 90)
+            mem = float(tool.get("mem", 85) or 85)
+            disk = float(tool.get("disk", 90) or 90)
+        except (TypeError, ValueError):
+            top, cpu, mem, disk = 5, 90.0, 85.0, 90.0
+        if psutil is None:
+            return "psutil not installed — run: pip install psutil", True
+        stats = collect_system_stats()
+        print(c("  " + _fmt_stats(stats).replace("\n", "\n  "), GRAY) + "\n")
+        print(c("  top processes:", BOLD))
+        for p in top_processes(top):
+            print(c(f"  {p.get('name', '?')}", BOLD) + c(f"  pid={p.get('pid')}", DIM) +
+                  c(f"  cpu={round(p.get('cpu_percent') or 0, 1)}%  mem={round(p.get('memory_percent') or 0, 1)}%", GRAY))
+        print()
+        for a in check_alerts({"cpu": cpu, "mem": mem, "disk": disk}):
+            color = RED if a.startswith("⚠") else GREEN
+            print(c("  " + a, color))
+        summary = " ".join(check_alerts({"cpu": cpu, "mem": mem, "disk": disk}))
+        return f"Monitored: {_fmt_stats(stats).splitlines()[0]}, {_fmt_stats(stats).splitlines()[1]}, {_fmt_stats(stats).splitlines()[2]}. {summary}", True
+    if action == "delegate_breakdown":
+        task = tool.get("task", "").strip()
+        if not task:
+            task = ask_bot("what is the complex task")
+        if not task:
+            return "No task given.", True
+        steps = break_down_task(task, int(tool.get("steps", 5) or 5))
+        print(c("  Task breakdown:", BOLD))
+        for i, s in enumerate(steps, 1):
+            print(c(f"  {i}. ", CYAN) + c(s, BOLD))
+        print()
+        if confirm_action("delegate the full task to opencode now") or BOT_MODE:
+            emit_progress("⚡ Delegating to my senior dev (opencode)...")
+            return summarize_delegate(run_delegate(task, tool.get("dir") or "")), True
+        return "Here's the breakdown (not delegated yet): " + " | ".join(f"{i}. {s}" for i, s in enumerate(steps, 1)), True
     return "I didn't catch that — try again?", True
 
 
@@ -1120,11 +1943,26 @@ def _build_chat_system() -> str:
     mem = load_memory()
     if mem:
         system += "\nMemory notes about the user:\n- " + "\n- ".join(mem)
+    lessons = load_mistakes()
+    if lessons:
+        system += (
+            "\n\nLESSONS LEARNED FROM PAST MISTAKES — NEVER repeat these. "
+            "If a lesson matches the current situation, follow the lesson:\n- "
+            + "\n- ".join(lessons)
+        )
     system += (
         "\n\nYOUR OWN CODE (self-knowledge index — always up to date with your current source, "
         "refreshed whenever your code changes). Use it to answer questions about yourself and "
         "to make precise self edits:\n" + get_self_index()
     )
+    if _load_plan_state()["mode"]:
+        system += (
+            "\n\nPLAN MODE IS ON: reply with your normal JSON actions. Side-effecting actions "
+            "(shell, file write, email, sort/organize, delegate, skill build, forget) will be "
+            "queued into a plan for the user's approval instead of executed — that is expected, "
+            "do not tell the user you're skipping or cancelling. After queuing, finish with a "
+            "short chat action telling the user you have a plan ready for their approval."
+        )
     return system
 
 
@@ -1184,6 +2022,74 @@ def _selection_context(line: str, history: list[dict[str, str]]) -> str:
 
 
 def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
+    low = line.strip().lower()
+    m = re.match(r"plan mode (on|off)\b", low)
+    if m:
+        st = _load_plan_state()
+        st["mode"] = m.group(1) == "on"
+        if not st["mode"]:
+            st["pending"] = []
+            st["plans"] = []
+        _save_plan_state(st)
+        msg = (
+            "Plan mode is ON — I'll propose a plan and wait for your approval before doing anything."
+            if st["mode"]
+            else "Plan mode is OFF — I'll act directly again."
+        )
+        history.append({"role": "assistant", "content": msg})
+        history = history[-MAX_HISTORY:]
+        append_conversation({"role": "assistant", "content": msg})
+        return msg, history
+    st = _load_plan_state()
+    _APPROVE_RE = re.compile(
+        r"\b(?:yes|ya|yep|yeah|yup|proceed|approve|confirm|sure|okay|ok|do it|sounds good|"
+        r"use delegation|delegate it|go ahead|go for it)\b|^go\b", re.I)
+    if st["pending"]:
+        if _APPROVE_RE.search(low):
+            tools, steps = st["pending"], st["plans"]
+            st["pending"] = []
+            st["plans"] = []
+            _save_plan_state(st)
+            lines = []
+            for i, (tool, step) in enumerate(zip(tools, steps), 1):
+                try:
+                    reply, _done = run_tool(env, tool, history)
+                    lines.append(f"{i}. {step} — {reply.strip()[:200]}")
+                except MissingInfo as mi:
+                    lines.append(f"{i}. {step} — need more info: {mi}")
+                    break
+                except Exception as e:
+                    lines.append(f"{i}. {step} — error: {e}")
+                    break
+            msg = "Plan approved — executing:\n" + "\n".join(lines)
+            history.append({"role": "assistant", "content": msg})
+            history = history[-MAX_HISTORY:]
+            append_conversation({"role": "assistant", "content": msg})
+            return msg, history
+        if re.match(r"^(?:no|nope|cancel|stop|don'?t|never ?mind|forget it|abort)\b", low):
+            st["pending"] = []
+            st["plans"] = []
+            _save_plan_state(st)
+            msg = "Plan cancelled — nothing was executed."
+            history.append({"role": "assistant", "content": msg})
+            history = history[-MAX_HISTORY:]
+            append_conversation({"role": "assistant", "content": msg})
+            return msg, history
+        st["pending"] = []
+        st["plans"] = []
+        _save_plan_state(st)
+    if re.search(
+        r"\b(?:wrong|incorrect)\b|that'?s not|not what i|i (?:said|meant|asked for)|"
+        r"don'?t (?:do|send|delete|run)|stop doing|why did you|you (?:forgot|missed|should'?ve|messed|broke)|"
+        r"never (?:do|send|delete|run)|my name is not",
+        low,
+    ):
+        last = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+        save_mistake(
+            f'Lesson: user corrected me — "{line.strip()[:150]}"'
+            + (f' (after my earlier: "{last[:200]}")' if last else "")
+            + ". Do not repeat this mistake."
+        )
     line = _answer_context(line, history)
     line = _selection_context(line, history)
     history.append({"role": "user", "content": line})
@@ -1202,6 +2108,7 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
             )
         last_actions = []
         completion_summary: str | None = None
+        last_tool_failed: str | None = None
         for _step in range(8):
             raw, usage, model = chat_call(env, msgs, max_tokens=900)
             tool = parse_tool_reply(raw)
@@ -1220,10 +2127,12 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
                     try:
                         wrap, usage, model = chat_call(
                             env,
-                            msgs + [{"role": "user", "content": "You got interrupted mid-task. Tell the user in 1-2 short plain sentences what you have done so far and what you were about to do next. No JSON, just a quick status update."}],
+                            msgs + [{"role": "user", "content": f"The user's message was: {line!r}. You got interrupted mid-task. Tell the user in 1-2 short plain sentences what you have done so far and what you were about to do next, addressing THEIR message. No JSON, no talk about JSON or output format — just a quick status update about their request."}],
                             max_tokens=250,
                         )
                         final_assistant_reply = wrap.strip()[:600] or "I got interrupted mid-task — what should I do next?"
+                        if final_assistant_reply.startswith("{") and '"action"' in final_assistant_reply[:120]:
+                            final_assistant_reply = completion_summary or "I got interrupted mid-task — what should I do next?"
                     except Exception:
                         final_assistant_reply = completion_summary or "I got interrupted mid-task — what should I do next?"
                 else:
@@ -1244,6 +2153,15 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
                 msgs.append({"role": "user", "content": 'You already ran that action and it succeeded. The task is done — reply with ONLY {"action":"chat","reply":"<a short completion message to the user>"} confirming what you did. Do not run any more actions.'})
                 continue
             last_actions.append(key)
+            st = _load_plan_state()
+            if st["mode"] and tool.get("action") in PLAN_GATED:
+                step = _plan_step(tool)
+                if step:
+                    st["pending"].append(tool)
+                    st["plans"].append(step)
+                    _save_plan_state(st)
+                    msgs.append({"role": "user", "content": f"[tool result] queued for plan approval (plan mode): {step}"})
+                    continue
             try:
                 reply, done = run_tool(env, tool, history)
             except MissingInfo as mi:
@@ -1253,13 +2171,17 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
                 final_assistant_reply = f"⚠ {e}"
                 break
             completion_summary = summarize_tool(tool, reply, completion_summary)
+            if tool.get("action") == "shell" and reply.startswith("✗"):
+                last_tool_failed = reply
             if done:
                 show = reply.strip()
-                if show and tool.get("action") == "shell" and len(show.splitlines()) > 3:
+                if show and tool.get("action") == "shell" and last_tool_failed:
+                    show = f"That failed — {last_tool_failed[:400]}"
+                elif show and tool.get("action") == "shell" and len(show.splitlines()) > 3:
                     try:
                         wrap, usage, model = chat_call(
                             env,
-                            msgs + [{"role": "user", "content": f"[A command you ran just finished. Command:\n{tool.get('command','')}\n\nOutput:\n{show[:1500]}\n\nTell the user the result in 1-2 short plain sentences with the important facts (like how many files were deleted or moved). Do NOT paste the raw output.]"}],
+                            msgs + [{"role": "user", "content": f"[A command you ran just finished. Command:\n{tool.get('command','')}\n\nOutput:\n{show[:1500]}\n\nTell the user the result in 1-2 short plain sentences with the important facts (like how many files were deleted or moved). If the output shows errors or failure, say so honestly — NEVER claim success. Do NOT paste the raw output.]"}],
                             max_tokens=250,
                         )
                         if wrap.strip():
@@ -1272,7 +2194,7 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
                     final_assistant_reply = show
                 else:
                     wrap, usage, model = _wrap_reply(env, msgs)
-                    if wrap.strip():
+                    if wrap.strip() and not (wrap.lstrip().startswith("{") and '"action"' in wrap[:120]):
                         print(c("  > ", CYAN) + wrap.strip())
                         print(tokens_str(usage, model))
                         final_assistant_reply = wrap.strip()
@@ -1286,10 +2208,82 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
     except Exception as e:
         print(c(f"  ✗ {e}", RED))
         final_assistant_reply = final_assistant_reply or f"⚠ {e}"
+    if last_tool_failed and final_assistant_reply and re.search(
+        r"\b(?:successfully|completed|done|extracted|finished|all ok)\b", final_assistant_reply, re.I
+    ):
+        final_assistant_reply = f"That didn't work — {last_tool_failed[:400]}"
+    st = _load_plan_state()
+    if st["mode"] and st["pending"]:
+        steps = "\n".join(f"{i}. {s}" for i, s in enumerate(st["plans"], 1))
+        final_assistant_reply = "PLAN MODE — here's my plan:\n" + steps + "\n\nApprove? (yes / go / proceed — or no to cancel)"
+    if final_assistant_reply and not any(k in last_actions for k in ("research",)):
+        if _wants_research(line) and (
+            (not last_actions or set(last_actions) <= {"chat", "delegate_breakdown"})
+            or (
+                any(k in last_actions for k in ("web", "research"))
+                and _reply_is_garbage(final_assistant_reply)
+            )
+        ):
+            try:
+                docs = deep_research(line, 5)
+                if len(docs) < 3:
+                    docs = web_search(line, 8)
+                if len(docs) >= 3:
+                    text = "\n".join(
+                        f"[{i}] {d['title']}: {d['url']} — {d['snippet'][:220]}"
+                        for i, d in enumerate(docs[:6], 1)
+                    )
+                    if "delegate_breakdown" in last_actions:
+                        sys_prompt = (
+                            "You produced the plan below WITHOUT web research. Rewrite and complete it "
+                            "using ONLY these sources, keeping its structure. Cite sources by their [n] "
+                            "number where relevant. Reply with ONLY the improved plan. No thinking process."
+                        )
+                    else:
+                        sys_prompt = (
+                            "Answer the user's question thoroughly using ONLY these sources. Be accurate, "
+                            "cover the important points, and cite sources by their [n] number where relevant. "
+                            "Answer directly — no thinking process, no meta-commentary."
+                            + _price_note(line)
+                        )
+                    answer = ""
+                    for _attempt in range(2):
+                        answer, _u, _m = api_call(
+                            env,
+                            {
+                                "messages": [
+                                    {"role": "system", "content": sys_prompt},
+                                    {"role": "user", "content": f"Question: {line}\n\nMy previous reply (ignore if empty): {final_assistant_reply[:400]}\n\nSources:\n{text}"},
+                                ],
+                                "temperature": 0.3,
+                                "max_tokens": 600,
+                            },
+                            json_mode=False,
+                        )
+                        answer = (answer or "").strip()
+                        if _clean_answer(answer) and not answer.lower().startswith("i can't provide"):
+                            break
+                    if _clean_answer(answer) and not (answer or "").lower().startswith("i can't provide"):
+                        srcs = "\n".join(f"{i}. {d['title']} — {d['url']}" for i, d in enumerate(docs[:5], 1))
+                        final_assistant_reply = answer + "\n\nSources:\n" + srcs
+                    else:
+                        final_assistant_reply = _source_fallback(
+                            docs, "The summary model glitched — here's what the sources say:"
+                        )
+                else:
+                    LOG.warning("research backstop: only %d docs for %r", len(docs), line[:60])
+                    final_assistant_reply = (
+                        "⚠ I couldn't pull up search results right now (the search backend seems "
+                        "rate-limited). Give it a minute and ask again — or tell me to answer from "
+                        "what I know."
+                    )
+            except Exception:
+                pass
     if final_assistant_reply:
         history.append({"role": "assistant", "content": final_assistant_reply})
         history = history[-MAX_HISTORY:]
         append_conversation({"role": "assistant", "content": final_assistant_reply})
+    _spawn_distill()
     return final_assistant_reply or "(no reply)", history
 
 
@@ -1317,7 +2311,7 @@ def cmd_chat(args: argparse.Namespace, env: dict[str, str]) -> None:
         if line in ("help", "?"):
             show_menu()
             continue
-        for free_text_cmd in ("web", "remember"):
+        for free_text_cmd in ("web", "remember", "research", "breakdown"):
             if line.startswith(free_text_cmd + " "):
                 rest = line[len(free_text_cmd):].strip()
                 if rest:
@@ -1327,8 +2321,11 @@ def cmd_chat(args: argparse.Namespace, env: dict[str, str]) -> None:
                         rest = rest.replace("--ask", "").strip()
                     line = f'{free_text_cmd} "{rest}"{flag}'
                     break
-        first = shlex.split(line)[0]
-        if first in ("email", "web", "sort", "remember", "memory", "forget"):
+        try:
+            first = shlex.split(line)[0]
+        except ValueError:
+            first = ""
+        if first in ("email", "web", "sort", "organize", "research", "email-draft", "monitor", "breakdown", "remember", "memory", "forget"):
             try:
                 dispatch(shlex.split(line), env)
             except SystemExit:
@@ -1339,6 +2336,11 @@ def cmd_chat(args: argparse.Namespace, env: dict[str, str]) -> None:
                 "email": "Email handled.",
                 "web": f"Web search done for: {line[len(first):].strip().strip('\"')}",
                 "sort": "File sort done.",
+                "organize": "Files organized.",
+                "research": f"Research done for: {line[len(first):].strip().strip('\"')}",
+                "email-draft": "Email draft handled.",
+                "monitor": "System monitored.",
+                "breakdown": f"Task breakdown for: {line[len(first):].strip().strip('\"')}",
                 "remember": "Note remembered.",
                 "memory": "Showed stored notes.",
                 "forget": "Memory cleared.",
@@ -1361,8 +2363,13 @@ def show_menu() -> None:
     commands = [
         ("chat", "talk naturally — it picks the right tool for you"),
         ("email", "draft an email with AI and send it"),
+        ("email-draft", "draft a tone-aware email (review before send)"),
         ("web", "search the web (--ask for an AI answer)"),
-        ("sort", "organize files into folders"),
+        ("research", "deep web research with cited sources"),
+        ("sort", "organize files into folders by type"),
+        ("organize", "organize files by type AND naming patterns"),
+        ("monitor", "system resources, disk, processes + alerts"),
+        ("breakdown", "break a task into sub-tasks and delegate"),
         ("remember", "store a note jorge remembers"),
         ("memory", "show stored notes"),
         ("forget", "clear stored notes"),
@@ -1396,6 +2403,10 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--ask", action="store_true", help="have AI summarize the results")
     w.set_defaults(func=cmd_web)
 
+    mu = sub.add_parser("music", help="find a Spotify song/playlist link")
+    mu.add_argument("query")
+    mu.set_defaults(func=cmd_music)
+
     rm = sub.add_parser("remember", help="store a note/topic jorge should remember")
     rm.add_argument("text", nargs="?", default="")
     rm.set_defaults(func=cmd_remember)
@@ -1408,12 +2419,47 @@ def build_parser() -> argparse.ArgumentParser:
 
     fg = sub.add_parser("forget", help="clear all stored notes")
     fg.set_defaults(func=cmd_forget)
+
+    org = sub.add_parser("organize", help="organize files by type AND naming patterns")
+    org.add_argument("path")
+    org.add_argument("--dry-run", action="store_true")
+    org.set_defaults(func=cmd_organize)
+
+    rs = sub.add_parser("research", help="deep web research with cited sources")
+    rs.add_argument("query")
+    rs.add_argument("-n", "--limit", type=int, default=8, help="number of results")
+    rs.add_argument("--ask", action="store_true", help="have AI summarize with citations")
+    rs.set_defaults(func=cmd_research)
+
+    em = sub.add_parser("email-draft", help="draft a tone-aware email (review before send)")
+    em.add_argument("--to", required=True)
+    em.add_argument("--subject", default=None)
+    em.add_argument("--topic", required=True)
+    em.add_argument("--tone", default="professional")
+    em.add_argument("--context", default=None)
+    em.add_argument("--recall", action="store_true", help="pull recent conversation context")
+    em.add_argument("--no-send", action="store_true", help="only draft, don't send")
+    em.set_defaults(func=cmd_email_draft)
+
+    mo = sub.add_parser("monitor", help="system resources, disk, processes with alerts")
+    mo.add_argument("--top", type=int, default=5, help="top N processes")
+    mo.add_argument("--cpu", type=float, default=90, help="cpu alert threshold %")
+    mo.add_argument("--mem", type=float, default=85, help="memory alert threshold %")
+    mo.add_argument("--disk", type=float, default=90, help="disk alert threshold %")
+    mo.set_defaults(func=cmd_monitor)
+
+    db = sub.add_parser("breakdown", help="break a complex task into sub-tasks and delegate")
+    db.add_argument("task")
+    db.add_argument("--dir", default=None, help="working folder for delegation")
+    db.add_argument("--steps", type=int, default=5, help="max sub-steps")
+    db.add_argument("--dry-run", action="store_true", help="only print the breakdown")
+    db.set_defaults(func=cmd_delegate_breakdown)
     return p
 
 
 def dispatch(argv: list[str], env: dict[str, str]) -> None:
     args = build_parser().parse_args(argv)
-    if args.command in ("email", "web", "chat", "remember", "memory", "forget"):
+    if args.command in ("email", "web", "music", "chat", "remember", "memory", "forget", "research", "email-draft", "breakdown"):
         args.func(args, env)
     else:
         args.func(args)
