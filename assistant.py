@@ -27,6 +27,9 @@ import tempfile
 import threading
 import time
 from email.message import EmailMessage
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +39,8 @@ try:
     import psutil
 except ImportError:  # pragma: no cover
     psutil = None
+
+from browser_use import browser_login, browser_task, instagram_upload, save_2fa, save_credentials
 
 __version__ = "2.1.0"
 
@@ -146,6 +151,120 @@ def _safe_input(prompt: str, default: str = "") -> str:
         return input(prompt).strip()
     except (EOFError, KeyboardInterrupt):
         return default
+
+
+def _readline_arrows(prompt: str, history: list[str]) -> str:
+    """Terminal line editor with arrow keys (Up/Down history, Left/Right cursor). Falls back to input()."""
+    import sys as _sys
+    if not _sys.stdin.isatty():
+        try:
+            return input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            return ""
+    import select as _sel
+    import termios as _termios
+    import tty as _tty
+
+    hist = list(history)
+    hist_idx = len(hist)
+    buf: list[str] = []
+    cur = 0
+    fd = _sys.stdin.fileno()
+    out = _sys.stdout
+
+    def _read_key() -> str:
+        raw = _sys.stdin.buffer.read(1)
+        if not raw:
+            return ""
+        if raw[0] == 0x1B:
+            if _sel.select([_sys.stdin], [], [], 0.2)[0]:
+                seq = _sys.stdin.buffer.read(2)
+            else:
+                return "\x1b"
+            return "\x1b" + seq.decode("utf-8", "replace")
+        if raw[0] < 0x80:
+            return raw.decode("utf-8", "replace")
+        seq = bytearray(raw)
+        while True:
+            try:
+                return seq.decode("utf-8")
+            except UnicodeDecodeError:
+                seq += _sys.stdin.buffer.read(1)
+
+    def _redraw() -> None:
+        line = "".join(buf)
+        out.write("\r\x1b[2K" + prompt + line)
+        back = len(line) - cur
+        if back > 0:
+            out.write(f"\x1b[{back}D")
+        out.flush()
+
+    def _load(idx: int) -> None:
+        nonlocal buf, cur, hist_idx
+        hist_idx = idx
+        buf = list(hist[hist_idx]) if 0 <= hist_idx < len(hist) else []
+        cur = len(buf)
+        _redraw()
+
+    old = _termios.tcgetattr(fd)
+    try:
+        _tty.setraw(fd)
+        out.write(prompt)
+        out.flush()
+        while True:
+            ch = _read_key()
+            if ch == "\x03":
+                out.write("\r\n")
+                out.flush()
+                raise KeyboardInterrupt
+            if ch == "\x04" and not buf:
+                out.write("\r\n")
+                out.flush()
+                raise EOFError
+            if ch in ("\r", "\n"):
+                out.write("\r\n")
+                out.flush()
+                return "".join(buf)
+            if ch == "\x7f":
+                if cur > 0:
+                    buf.pop(cur - 1)
+                    cur -= 1
+                    _redraw()
+                continue
+            if ch == "\x1b[A":
+                if hist_idx > 0:
+                    _load(hist_idx - 1)
+                continue
+            if ch == "\x1b[B":
+                if hist_idx < len(hist):
+                    _load(hist_idx + 1)
+                continue
+            if ch == "\x1b[C":
+                if cur < len(buf):
+                    cur += 1
+                    _redraw()
+                continue
+            if ch == "\x1b[D":
+                if cur > 0:
+                    cur -= 1
+                    _redraw()
+                continue
+            if ch == "\x1b[H":
+                cur = 0
+                _redraw()
+                continue
+            if ch == "\x1b[F":
+                cur = len(buf)
+                _redraw()
+                continue
+            if ch == "\x1b":
+                continue
+            if len(ch) == 1 and 32 <= ord(ch) < 127 or ord(ch) >= 160:
+                buf.insert(cur, ch)
+                cur += 1
+                _redraw()
+    finally:
+        _termios.tcsetattr(fd, _termios.TCSADRAIN, old)
 
 
 # ---------------- environment ----------------
@@ -269,7 +388,7 @@ def forget_memory() -> None:
 
 
 PLAN_STATE_FILE = SCRIPT_DIR / "plan_state.json"
-PLAN_GATED = ("shell", "write", "email", "email_draft", "sort", "organize", "delegate", "skill", "forget")
+PLAN_GATED = ("shell", "write", "email", "email_draft", "sort", "organize", "delegate", "skill", "forget", "browser")
 DISTILL_SCRIPT = SCRIPT_DIR / "distill.py"
 DISTILL_LOCK = SCRIPT_DIR / "distill.lock"
 
@@ -404,12 +523,23 @@ def edit_text(original: str) -> str:
         tmp.unlink(missing_ok=True)
 
 
-def send_email(env: dict[str, str], to: str, subject: str, body: str) -> None:
-    msg = EmailMessage()
+def send_email(env: dict[str, str], to: str, subject: str, body: str, attachments: list[str] | None = None) -> None:
+    if attachments:
+        msg = MIMEMultipart("mixed")
+        msg.attach(MIMEText(body, "plain"))
+    else:
+        msg = EmailMessage()
+        msg.set_content(body)
     msg["Subject"] = subject
     msg["From"] = f"{env.get('SMTP_NAME', env['SMTP_USER'])} <{env['SMTP_USER']}>"
     msg["To"] = to
-    msg.set_content(body)
+    for path in attachments or []:
+        path = os.path.expanduser(path)
+        fname = os.path.basename(path)
+        with open(path, "rb") as fh:
+            part = MIMEApplication(fh.read(), Name=fname)
+        part["Content-Disposition"] = f'attachment; filename="{fname}"'
+        msg.attach(part)
     with smtplib.SMTP(env["SMTP_HOST"], int(env["SMTP_PORT"])) as s:
         s.starttls()
         s.login(env["SMTP_USER"], env["SMTP_APP_PASSWORD"])
@@ -458,12 +588,15 @@ def cmd_email(args: argparse.Namespace, env: dict[str, str]) -> None:
     print(c("  ✓ Sent to ", BOLD, GREEN) + c(args.to, BOLD) + "\n")
 
 
-def email_flow(env: dict[str, str], to: str, subject: str, topic: str, tone: str = "professional") -> str:
+def email_flow(env: dict[str, str], to: str, subject: str, topic: str, tone: str = "professional", file: str | None = None) -> str:
     body = _email_approve_loop(env, to, subject, topic, tone)
     if body is None:
         return "cancelled"
+    attachments = [file] if file else None
+    if attachments:
+        print(c("  📎 attaching: ", CYAN) + c(os.path.basename(attachments[0]), BOLD))
     print(c("  ✈ sending...", CYAN))
-    send_email(env, to, subject, body)
+    send_email(env, to, subject, body, attachments)
     print(c("  ✓ Sent to ", BOLD, GREEN) + c(to, BOLD))
     return "sent"
 
@@ -642,6 +775,87 @@ def cmd_music(args: argparse.Namespace, env: dict[str, str]) -> None:
 
 
 # ---------------- MEMORY COMMANDS ----------------
+
+def cmd_browser(args: argparse.Namespace, env: dict[str, str]) -> None:
+    task = args.task
+    headed = bool(re.search(r"\bheaded\s*$", task, re.I))
+    if headed:
+        task = re.sub(r"\s*headed\s*$", "", task, flags=re.I).strip()
+    print(BANNER)
+    print(c("  🌐 browser task: ", GRAY) + c(task, BOLD)
+          + (c("  (visible window)", DIM) if headed else c("  (headless Chrome)", DIM)) + "\n")
+    result = browser_task(task, args.url or "", decide=_browser_decide, ask=ask_bot,
+                          progress=emit_progress, headless=not headed)
+    print()
+    box(result, GREEN if result and not result.startswith(("⚠", "🔐", "I got")) else YELLOW)
+    print()
+
+
+def cmd_browser_login(args: argparse.Namespace, env: dict[str, str]) -> None:
+    if BOT_MODE:
+        print(c("  browser-login needs your keyboard — run it in the terminal: ", GRAY)
+              + c(f"jorge browser-login {args.site}", BOLD))
+        return
+    print(BANNER)
+    print(c("  🔐 visible login for ", GRAY) + c(args.site, BOLD) + "\n")
+    result = browser_login(args.site, progress=emit_progress)
+    print()
+    box(result, GREEN if result.startswith("✅") else YELLOW)
+    print()
+
+
+def _find_media(arg: str) -> str:
+    """Resolve a video file: full path, filename, or auto-pick the newest video if empty."""
+    from pathlib import Path as _Path
+    if not arg:
+        arg = "*.mp4"
+    direct = _Path(arg).expanduser()
+    if direct.exists() and direct.is_file():
+        return str(direct)
+    dirs = [p.expanduser() for p in (_Path("~/Videos"), _Path("~/Downloads"), _Path("~/Desktop")) if p.expanduser().is_dir()]
+    exact = [p for d in dirs for p in d.rglob(arg) if p.is_file()]
+    if not exact:
+        low = arg.lower().lstrip("*")
+        exact = [p for d in dirs for p in d.rglob("*") if p.is_file() and p.suffix.lower() in (".mp4", ".mov", ".mkv", ".webm") and low in p.name.lower()]
+    if not exact:
+        return ""
+    return str(max(exact, key=lambda p: p.stat().st_mtime))
+
+
+def cmd_instagram_upload(args: argparse.Namespace, env: dict[str, str]) -> None:
+    if BOT_MODE:
+        print(c("  instagram-upload needs the terminal — run: ", GRAY)
+              + c(f"jorge instagram-upload \"{args.file}\"", BOLD))
+        return
+    pieces = list(args.file)
+    headed = bool(re.search(r"\bheaded$", pieces[-1], re.I)) if pieces else False
+    if headed:
+        pieces.pop()
+    path = _find_media(" ".join(pieces).strip())
+    if not path:
+        print(BANNER)
+        print(c("  📤 instagram upload: ", GRAY) + c("no video found for", RED)
+              + c(" ".join(pieces).strip() or "<none>", BOLD) + "\n")
+        print(c("  recent videos:", GRAY))
+        from pathlib import Path as _Path
+        for d in (_Path("~/Videos"), _Path("~/Downloads"), _Path("~/Desktop")):
+            d = d.expanduser()
+            if not d.is_dir():
+                continue
+            for p in sorted(d.rglob("*"), key=lambda p: p.stat().st_mtime if p.is_file() else 0, reverse=True):
+                if p.is_file() and p.suffix.lower() in (".mp4", ".mov", ".mkv", ".webm"):
+                    print(c(f"   - {p}", DIM))
+                    break
+        print()
+        return
+    print(BANNER)
+    print(c("  📤 instagram upload: ", GRAY) + c(os.path.basename(path), BOLD)
+          + (c("  (visible window)", DIM) if headed else "") + "\n")
+    result = instagram_upload(path, args.caption or "", progress=emit_progress, headless=not headed)
+    print()
+    box(result, GREEN if result.startswith("✅") else YELLOW)
+    print()
+
 
 def cmd_remember(args: argparse.Namespace, env: dict[str, str]) -> None:
     print(BANNER)
@@ -1135,7 +1349,7 @@ You must reply with ONLY one JSON object, no markdown fences, no extra text, no 
 
 {"action": "chat", "reply": "your answer"}
 {"action": "web", "query": "search query"}
-{"action": "email", "to": "recipient@example.com", "subject": "...", "topic": "what the email should say"}
+{"action": "email", "to": "recipient@example.com", "subject": "...", "topic": "what the email should say", "file": "/absolute/path/to/file.zip"}  # file is OPTIONAL: to attach a file, FIRST locate it with a shell command, then pass its real absolute path in "file". Never invent a path.
 {"action": "sort", "path": "/folder/path"}
 {"action": "remember", "text": "note to store"}
 {"action": "memory"}
@@ -1152,15 +1366,21 @@ You must reply with ONLY one JSON object, no markdown fences, no extra text, no 
 {"action": "email_draft", "to": "recipient@example.com", "subject": "...", "topic": "what it should say", "tone": "professional|friendly|casual|formal|warm|direct|urgent", "context": "optional extra context", "recall": true}
 {"action": "monitor", "top": 5, "cpu": 90, "mem": 85, "disk": 90}
 {"action": "delegate_breakdown", "task": "the complex task", "dir": "optional folder", "steps": 5}
+{"action": "browser", "task": "what to do in the real browser", "url": "optional start URL"}
+{"action": "browser_creds", "site": "discord.com", "email": "you@x.com", "password": "hunter2"}
+{"action": "browser_2fa", "site": "discord.com", "code": "123456"}
 
 Rules:
-- If the user asks to email/send a message -> action email. Extract recipient, subject, and the content/topic. Use "" if unknown.
+- If the user asks to email/send a message -> action email. Extract recipient, subject, and the content/topic. To find the recipient's address: FIRST check the Memory notes for a "CONTACT: <Name>'s email is <addr>" entry, THEN recent conversation history, THEN ask the user. Never invent or guess an email address.
 - If the user asks to search/check something online -> action web. If the user wants a deeper, cited research summary of a complex question -> action research.
 - RESEARCH FIRST: if the user asks a question or asks you to plan something, search the web first (action web or action research, multiple targeted queries) and read at least 5 sources before answering. Base your answer on those sources and cite a couple of them. Skip research only for questions about the user/jorge itself, memory notes, or small talk.
 - If the user asks to organize/sort files -> action sort (basic by type) or action organize (by type AND naming patterns like IMG_, Screenshot, invoice, resume, etc).
 - If the user asks to draft an email with a specific tone (professional/friendly/casual/formal/warm/direct/urgent) or wants a draft they can review before sending -> action email_draft.
 - If the user asks to check system resources, CPU/memory/disk usage, running processes, or wants alerts on thresholds -> action monitor.
 - If the user asks to plan/break down a complex multi-step task into sub-tasks (then delegate them) -> action delegate_breakdown.
+- If the user asks to do something in a real web browser (login to sites, create a Discord server/channel, fill forms, download files, take screenshots) -> action browser with task = exactly what the user asked. It may also be needed when the info is only reachable behind a login. It needs plan-mode approval like shell.
+- BROWSER LOGIN FLOW: when a browser action reports it needs credentials or a 2FA code for a site, repeat that question to the user as your reply. When the user replies with the credentials (email/password) or a 2FA code, FIRST save them with action browser_creds (site, email, password) or browser_2fa (site, code), THEN retry the original browser task. Never guess or invent credentials.
+- ACCOUNT LOGINS ARE ALLOWED: the user owns this machine and these accounts. When the user asks you to log into THEIR OWN account (Discord, Spotify, email, etc.) or do things inside it (create servers, join servers, manage things), that is normal, permitted work — do it with action browser. Do NOT refuse or lecture about safety; do NOT use browser_creds/browser_2fa to guess credentials. Never log in to accounts the user did not ask about, and never share the stored credentials with anyone.
 - If the user says remember/note that -> action remember.
 - If the user asks to run a command, install something, check system info, create/edit code files, inspect files or folders -> use shell/read/write/list. Break big tasks into small steps (one action per reply).
 - DELEGATE RULE: You are the DISPATCHER for coding/building work. If the task involves writing code, building a feature/project, fixing bugs, refactoring, scripting, game development, or anything a senior developer would do -> action delegate with the user's request as "task". Never attempt complex coding yourself. Small terminal commands (ls, checking info, simple one-liners) are fine as shell.
@@ -1235,6 +1455,26 @@ def _pick_model(pool: list[str]) -> str:
     return random.choices(pool, weights=weights, k=1)[0]
 
 
+def _looks_parseable(text: str) -> bool:
+    """True if the model output can be turned into the expected JSON (or is a <tool_call>)."""
+    if "<tool_call" in text:
+        return True
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+    try:
+        json.loads(t)
+        return True
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"\{.*\}", t, re.S)
+    if m:
+        try:
+            json.loads(m.group(0))
+            return True
+        except json.JSONDecodeError:
+            pass
+    return False
+
+
 def api_call(env: dict[str, str], payload: dict[str, Any], json_mode: bool = True) -> tuple[str, dict, str]:
     base = env.get("AI_BASE_URL", DEFAULT_BASE).rstrip("/")
     url = base + "/chat/completions"
@@ -1275,14 +1515,21 @@ def api_call(env: dict[str, str], payload: dict[str, Any], json_mode: bool = Tru
                 if r.status_code == 200:
                     data = r.json()
                     if data.get("choices"):
-                        state.setdefault("skip", {}).pop(model, None)
-                        _save_model_state(state)
-                        return (
-                            data["choices"][0]["message"]["content"].strip(),
-                            data.get("usage", {}),
-                            data.get("model", env.get("AI_MODEL", DEFAULT_MODEL)),
-                        )
-                    last_err = "API returned no reply"
+                        content = data["choices"][0]["message"].get("content") or ""
+                        if content.strip():
+                            if json_mode and not _looks_parseable(content):
+                                state.setdefault("skip", {})[model] = now
+                                _save_model_state(state)
+                                last_err = f"{model} returned unparseable output (quarantined {MODEL_QUARANTINE_H}h)"
+                                break
+                            state.setdefault("skip", {}).pop(model, None)
+                            _save_model_state(state)
+                            return (
+                                content.strip(),
+                                data.get("usage", {}),
+                                data.get("model", env.get("AI_MODEL", DEFAULT_MODEL)),
+                            )
+                    last_err = "API returned empty reply"
                     continue
                 if r.status_code == 429:
                     state.setdefault("skip", {})[model] = now
@@ -1380,6 +1627,7 @@ def _normalize_shell_cmd(cmd: str) -> str:
 
 def run_shell(command: str, timeout: int = 120) -> str:
     r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+    out = (r.stdout or "") + (r.stderr or "")
     if len(out) > MAX_TOOL_REPLY:
         out = out[:MAX_TOOL_REPLY] + "\n...[truncated]"
     out = out.strip() or "(no output)"
@@ -1488,6 +1736,74 @@ def summarize_delegate(out: str) -> str:
     return _clip(text)
 
 
+_BROWSER_DECIDE_SYS = (
+    "You are operating a real web browser for the user's task. You see the page state "
+    "(URL, visible text, and a numbered list of clickable elements and inputs). "
+    "Pick ONE next action. Your reply must be ONLY one JSON object — no thinking process, "
+    "no explanation, no markdown, no commentary:\n"
+    '{"cmd":"click","i":N} click element N\n'
+    '{"cmd":"type","i":N,"value":"text"} type into input N (replace ALL its content)\n'
+    '{"cmd":"goto","url":"https://..."} navigate to a URL\n'
+    '{"cmd":"screenshot"} save a screenshot\n'
+    '{"cmd":"answer","text":"final reply to the user"} ONLY when the task is complete, or impossible '
+    "(e.g. login wall, captcha, blocked) — then answer honestly with what happened and why."
+)
+
+
+def _browser_decide(task: str, snapshot: str, history: list[str]) -> dict:
+    env = load_env()
+    hist = "\n".join(f"- {h}" for h in history[-8:]) or "- (none yet)"
+    msgs = [
+        {"role": "system", "content": _BROWSER_DECIDE_SYS},
+        {"role": "user", "content": (
+            f"TASK: {task}\n\nACTIONS SO FAR:\n{hist}\n\n"
+            f"CURRENT PAGE STATE:\n{snapshot}"
+        )},
+    ]
+    for _attempt in range(6):
+        try:
+            raw, _usage, _model = api_call(
+                env, {"messages": msgs, "temperature": 0.1, "max_tokens": 160},
+                json_mode=False,
+            )
+        except Exception:
+            time.sleep(1.0)
+            continue
+        obj = parse_tool_reply(raw)
+        if isinstance(obj, dict) and obj.get("cmd"):
+            return obj
+        msgs.append({"role": "user", "content": (
+            f"You replied with text that is NOT a JSON object (it was: {raw[:200]!r}). "
+            "Ignore that. Reply with ONLY one JSON object from the allowed commands — "
+            "no reasoning, no explanation, nothing else."
+        )})
+        time.sleep(0.8)
+    lines = snapshot.splitlines()
+    where = " ".join(l for l in lines[:2] if l.startswith(("URL:", "TITLE:")))
+    return {"cmd": "answer", "text": (
+        f"My response brain glitched after that step — but the browser itself is fine. "
+        f"Current page: {where or '?'}. Tell me to continue and I'll take it from here."
+    )}
+
+
+def _learn_contact(history: list[dict[str, str]], to: str) -> None:
+    to = to.strip()
+    if not to or "@" not in to:
+        return
+    local = to.split("@")[0]
+    user_lines = " ".join(str(m.get("content", "")) for m in history if m.get("role") == "user")
+    name = None
+    m = re.search(r"(?:to|for)\s+([A-Z][A-Za-z]+)", user_lines)
+    if m and m.group(1).lower() in local.lower():
+        name = m.group(1)
+    if not name:
+        stem = re.sub(r"\d+", "", local)
+        if stem.isalpha() and len(stem) >= 3:
+            name = stem[:1].upper() + stem[1:]
+    if name:
+        save_memory_entry(f"CONTACT: {name}'s email is {to}", replace_similar=True)
+
+
 def run_tool(env: dict[str, str], tool: dict[str, Any], history: list[dict[str, str]]) -> tuple[str, bool]:
     action = tool.get("action")
     if action == "chat":
@@ -1542,6 +1858,15 @@ def run_tool(env: dict[str, str], tool: dict[str, Any], history: list[dict[str, 
         to = tool.get("to", "").strip()
         subject = tool.get("subject", "").strip()
         topic = tool.get("topic", "").strip()
+        fpath = str(tool.get("file") or tool.get("attach") or tool.get("attachment") or "").strip()
+        if fpath:
+            fpath = os.path.expanduser(fpath)
+            if not Path(fpath).exists():
+                raise MissingInfo(
+                    f"the file {fpath!r} doesn't exist — locate it first (e.g. with a shell find) and use the real absolute path"
+                )
+            if Path(fpath).stat().st_size > 25 * 1024 * 1024:
+                return "That file is too big to attach to an email (email limit is ~25MB). Upload it to Google Drive using the browser, then email the share link instead.", True
         if not to:
             to = ask_bot("who is it to")
         if not subject:
@@ -1550,8 +1875,9 @@ def run_tool(env: dict[str, str], tool: dict[str, Any], history: list[dict[str, 
             topic = ask_bot("what should it say")
         if not to or not subject or not topic:
             return "Email cancelled — missing details.", True
-        if email_flow(env, to, subject, topic) == "sent":
-            return "Email sent successfully.", True
+        if email_flow(env, to, subject, topic, file=fpath or None) == "sent":
+            _learn_contact(history, to)
+            return "Email sent successfully" + (f" with attachment {os.path.basename(fpath)}." if fpath else "."), True
         return "Email cancelled by user.", True
     if action == "sort":
         path = tool.get("path", "").strip()
@@ -1773,6 +2099,36 @@ def run_tool(env: dict[str, str], tool: dict[str, Any], history: list[dict[str, 
             emit_progress("⚡ Delegating to my senior dev (opencode)...")
             return summarize_delegate(run_delegate(task, tool.get("dir") or "")), True
         return "Here's the breakdown (not delegated yet): " + " | ".join(f"{i}. {s}" for i, s in enumerate(steps, 1)), True
+    if action == "browser":
+        task = tool.get("task", "").strip()
+        if not task:
+            task = ask_bot("what should I do in the browser")
+        if not task:
+            return "No browser task given.", True
+        headed = bool(re.search(r"\bheaded\s*$", task, re.I))
+        if headed:
+            task = re.sub(r"\s*headed\s*$", "", task, flags=re.I).strip()
+        return browser_task(
+            task,
+            start_url=tool.get("url", ""),
+            decide=_browser_decide,
+            ask=ask_bot,
+            progress=emit_progress,
+            headless=not headed,
+        ), True
+    if action == "browser_creds":
+        site = tool.get("site", "").strip()
+        email = tool.get("email", "").strip()
+        password = tool.get("password", "").strip()
+        if not (site and email and password):
+            return "browser_creds needs site, email and password.", True
+        return save_credentials(site, email, password), True
+    if action == "browser_2fa":
+        site = tool.get("site", "").strip()
+        code = tool.get("code", "").strip()
+        if not (site and code):
+            return "browser_2fa needs site and code.", True
+        return save_2fa(site, code), True
     return "I didn't catch that — try again?", True
 
 
@@ -2039,6 +2395,7 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
         history.append({"role": "assistant", "content": msg})
         history = history[-MAX_HISTORY:]
         append_conversation({"role": "assistant", "content": msg})
+        print(c("  > ", CYAN) + msg)
         return msg, history
     st = _load_plan_state()
     _APPROVE_RE = re.compile(
@@ -2060,11 +2417,12 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
                     break
                 except Exception as e:
                     lines.append(f"{i}. {step} — error: {e}")
-                    break
+                    continue
             msg = "Plan approved — executing:\n" + "\n".join(lines)
             history.append({"role": "assistant", "content": msg})
             history = history[-MAX_HISTORY:]
             append_conversation({"role": "assistant", "content": msg})
+            print(c("  > ", CYAN) + msg)
             return msg, history
         if re.match(r"^(?:no|nope|cancel|stop|don'?t|never ?mind|forget it|abort)\b", low):
             st["pending"] = []
@@ -2074,6 +2432,7 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
             history.append({"role": "assistant", "content": msg})
             history = history[-MAX_HISTORY:]
             append_conversation({"role": "assistant", "content": msg})
+            print(c("  > ", CYAN) + msg)
             return msg, history
         st["pending"] = []
         st["plans"] = []
@@ -2147,8 +2506,13 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
             if key in last_actions:
                 last_actions.append(key)
                 if last_actions.count(key) >= 3:
-                    print(c("  > ", CYAN) + (completion_summary or "Done."))
-                    final_assistant_reply = completion_summary or "Done."
+                    st2 = _load_plan_state()
+                    if st2["mode"] and st2["pending"]:
+                        steps2 = "\n".join(f"{i}. {s}" for i, s in enumerate(st2["plans"], 1))
+                        final_assistant_reply = "PLAN MODE — here's my plan:\n" + steps2 + "\n\nApprove? (yes / go / proceed — or no to cancel)"
+                    else:
+                        final_assistant_reply = completion_summary or "I kept repeating the same action, so I stopped — nothing new ran. What should I do next?"
+                    print(c("  > ", CYAN) + final_assistant_reply)
                     break
                 msgs.append({"role": "user", "content": 'You already ran that action and it succeeded. The task is done — reply with ONLY {"action":"chat","reply":"<a short completion message to the user>"} confirming what you did. Do not run any more actions.'})
                 continue
@@ -2291,14 +2655,19 @@ def cmd_chat(args: argparse.Namespace, env: dict[str, str]) -> None:
     if not env.get("AI_API_KEY"):
         print(c("✗ AI_API_KEY missing in .env.", BOLD, RED))
         sys.exit(1)
+    if getattr(args, "once", None):
+        history = load_conversation(14)
+        brain_reply(env, args.once.strip(), history)
+        return
     print(BANNER)
     print(c("  chat mode — talk naturally. ", GRAY) + c("quit", BOLD) + c(" to exit", GRAY) + "\n")
     history = load_conversation(14)
     if history:
         print(c(f"  (loaded past conversation — {len(history)} messages)", DIM) + "\n")
+    chat_hist: list[str] = []
     while True:
         try:
-            line = input(c("jorge > ", CYAN))
+            line = _readline_arrows(c("jorge > ", CYAN), chat_hist)
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -2308,10 +2677,13 @@ def cmd_chat(args: argparse.Namespace, env: dict[str, str]) -> None:
         if line in ("quit", "exit", "q"):
             print(c("  see ya, boss!", GRAY))
             return
+        chat_hist.append(line)
+        if len(chat_hist) > 100:
+            chat_hist.pop(0)
         if line in ("help", "?"):
             show_menu()
             continue
-        for free_text_cmd in ("web", "remember", "research", "breakdown"):
+        for free_text_cmd in ("web", "remember", "research", "breakdown", "browser"):
             if line.startswith(free_text_cmd + " "):
                 rest = line[len(free_text_cmd):].strip()
                 if rest:
@@ -2325,7 +2697,12 @@ def cmd_chat(args: argparse.Namespace, env: dict[str, str]) -> None:
             first = shlex.split(line)[0]
         except ValueError:
             first = ""
-        if first in ("email", "web", "sort", "organize", "research", "email-draft", "monitor", "breakdown", "remember", "memory", "forget"):
+        if first == "browser" and len(shlex.split(line)) < 2:
+            task = _safe_input(c("  what should I do in the browser? ", CYAN))
+            if not task:
+                continue
+            line = f'browser "{task}"'
+        if first in ("email", "web", "sort", "organize", "research", "email-draft", "monitor", "breakdown", "remember", "memory", "forget", "browser", "browser-login", "instagram-upload"):
             try:
                 dispatch(shlex.split(line), env)
             except SystemExit:
@@ -2344,6 +2721,9 @@ def cmd_chat(args: argparse.Namespace, env: dict[str, str]) -> None:
                 "remember": "Note remembered.",
                 "memory": "Showed stored notes.",
                 "forget": "Memory cleared.",
+                "browser": f"Browser task done for: {line[len(first):].strip().strip('\"')}",
+                "browser-login": f"Login window for: {line[len(first):].strip().strip('\"')}",
+                "instagram-upload": f"Upload finished for: {line[len(first):].strip().strip('\"')}",
             }[first]
             append_conversation({"role": "user", "content": line})
             append_conversation({"role": "assistant", "content": done})
@@ -2352,9 +2732,6 @@ def cmd_chat(args: argparse.Namespace, env: dict[str, str]) -> None:
                 save_memory_entry(f"assistant: {done}")
             continue
         reply, history = brain_reply(env, line, history)
-        save_memory_entry(f"user: {line}")
-        if reply and reply not in ("(no reply)",):
-            save_memory_entry(f"assistant: {reply}")
 
 
 def show_menu() -> None:
@@ -2370,12 +2747,15 @@ def show_menu() -> None:
         ("organize", "organize files by type AND naming patterns"),
         ("monitor", "system resources, disk, processes + alerts"),
         ("breakdown", "break a task into sub-tasks and delegate"),
+        ("browser", "do a task in a real browser (append 'headed' for a visible window)"),
+        ("browser-login", "open the browser visibly so YOU log in (captcha/2FA safe)"),
+        ("instagram-upload", "upload a video to instagram (no AI brain, reliable)"),
         ("remember", "store a note jorge remembers"),
         ("memory", "show stored notes"),
         ("forget", "clear stored notes"),
     ]
     for name, desc in commands:
-        print(c(f"  {name:<10}", BOLD, GREEN) + c(desc, GRAY))
+        print(c(f"  {name:<17}", BOLD, GREEN) + c(desc, GRAY))
     print(c("\n  e.g. ", CYAN) + c("jorge email --to friend@x.com --subject \"Hi\" --topic \"ask about saturday\"", GRAY))
     print()
 
@@ -2407,6 +2787,20 @@ def build_parser() -> argparse.ArgumentParser:
     mu.add_argument("query")
     mu.set_defaults(func=cmd_music)
 
+    br = sub.add_parser("browser", help="do a task in a real headless browser (login, forms, downloads)")
+    br.add_argument("task")
+    br.add_argument("--url", default=None)
+    br.set_defaults(func=cmd_browser)
+
+    bl = sub.add_parser("browser-login", help="open the profile VISIBLY so you can log in manually (captcha/2FA safe)")
+    bl.add_argument("site")
+    bl.set_defaults(func=cmd_browser_login)
+
+    iu = sub.add_parser("instagram-upload", help="upload a video to instagram with a hardcoded flow (no AI brain); append 'headed' for a visible window")
+    iu.add_argument("file", nargs="+")
+    iu.add_argument("--caption", default="")
+    iu.set_defaults(func=cmd_instagram_upload)
+
     rm = sub.add_parser("remember", help="store a note/topic jorge should remember")
     rm.add_argument("text", nargs="?", default="")
     rm.set_defaults(func=cmd_remember)
@@ -2415,6 +2809,7 @@ def build_parser() -> argparse.ArgumentParser:
     mm.set_defaults(func=cmd_memory)
 
     c = sub.add_parser("chat", help="talk naturally — it picks the right tool for you")
+    c.add_argument("--once", default=None, help="process one message and exit (for voice/avatar use)")
     c.set_defaults(func=cmd_chat)
 
     fg = sub.add_parser("forget", help="clear all stored notes")
@@ -2459,7 +2854,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def dispatch(argv: list[str], env: dict[str, str]) -> None:
     args = build_parser().parse_args(argv)
-    if args.command in ("email", "web", "music", "chat", "remember", "memory", "forget", "research", "email-draft", "breakdown"):
+    if args.command in ("email", "web", "music", "chat", "remember", "memory", "forget", "research", "email-draft", "breakdown", "browser", "browser-login", "instagram-upload"):
         args.func(args, env)
     else:
         args.func(args)

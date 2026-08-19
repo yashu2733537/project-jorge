@@ -1,5 +1,6 @@
 # secrets — never commit
 .env
+browser_secrets.json
 
 # WhatsApp session (contains your linked-device credentials)
 whatsapp-bot/wa_session/
