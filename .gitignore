@@ -27,3 +27,11 @@ __pycache__/
 
 # node
 whatsapp-bot/node_modules/
+discord-bot/node_modules/
+
+# chess game state (runtime)
+chess_games.json
+chess_challenges.json
+
+# discord chat histories (runtime)
+dc_history_*.json

@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover
     psutil = None
 
 from browser_use import browser_login, browser_task, instagram_upload, save_2fa, save_credentials
+import chess_bot
 
 __version__ = "2.1.0"
 
@@ -57,9 +58,11 @@ MODEL_STATE_FILE = SCRIPT_DIR / "models_state.json"
 MAX_CONV_LINES = 500
 MAX_HISTORY = 40
 MAX_TOOL_REPLY = 2500
-MODEL_QUARANTINE_H = 3
+MODEL_QUARANTINE_MIN = 15
 
 BOT_MODE = os.environ.get("JORGE_BOT") == "1"
+
+LAST_MODEL: str | None = None
 
 LOG = logging.getLogger("jorge")
 
@@ -485,12 +488,34 @@ def load_conversation(n: int) -> list[dict[str, str]]:
 
 # ---------------- EMAIL ----------------
 
+EMAIL_GARBAGE_MARKS = (
+    "<system-reminder>", "operational mode", "analyze input", "step 1:", "step 2:", "step 3:",
+    "here's my thinking", "let me think", "let me analyze", "i need to write", "1. analyze",
+    "as an ai", "i cannot", "i'll write", "here's the email", "subject:", "thinking process",
+)
+
+
+def _email_looks_clean(body: str) -> bool:
+    body = (body or "").strip()
+    if not body or len(body) > 2500:
+        return False
+    low = body.lower()
+    if any(mark in low for mark in EMAIL_GARBAGE_MARKS):
+        return False
+    if body.startswith(GARBLE_PREFIXES):
+        return False
+    if body.startswith("{") and '"' in body[:80]:
+        return False
+    return True
+
+
 def draft_email(env: dict[str, str], to: str, subject: str, topic: str, tone: str = "professional",
                 context: str | None = None) -> tuple[str, dict]:
     system = (
         "You are a helpful email-writing assistant. Write a clear, concise email "
         f"with a {tone} tone. Return ONLY the email body (text after the subject). "
-        "No preamble, no signature, no 'Subject:' line."
+        "No preamble, no signature, no 'Subject:' line. Never explain what you are doing, "
+        "never number your thoughts, never mention system instructions — just the email text."
     )
     memory = load_memory()
     if memory:
@@ -507,7 +532,17 @@ def draft_email(env: dict[str, str], to: str, subject: str, topic: str, tone: st
         "temperature": 0.7,
         "max_tokens": 500,
     }
-    body, usage, _model = api_call(env, payload, json_mode=False)
+    body = ""
+    usage = {}
+    for _attempt in range(3):
+        body, usage, _model = api_call(env, payload, json_mode=False)
+        body = (body or "").strip()
+        if _email_looks_clean(body):
+            break
+        body = ""
+        time.sleep(1.5)
+    if not body:
+        body = (f"Hi,\n\n{topic}\n\nBest regards.")[:2500]
     return body, usage
 
 
@@ -850,8 +885,8 @@ def cmd_instagram_upload(args: argparse.Namespace, env: dict[str, str]) -> None:
         return
     print(BANNER)
     print(c("  📤 instagram upload: ", GRAY) + c(os.path.basename(path), BOLD)
-          + (c("  (visible window)", DIM) if headed else "") + "\n")
-    result = instagram_upload(path, args.caption or "", progress=emit_progress, headless=not headed)
+          + c("  (visible window — needed for the share to register)", DIM) + "\n")
+    result = instagram_upload(path, args.caption or "", progress=emit_progress, headless=False)
     print()
     box(result, GREEN if result.startswith("✅") else YELLOW)
     print()
@@ -1363,6 +1398,10 @@ You must reply with ONLY one JSON object, no markdown fences, no extra text, no 
 {"action": "skill", "propose": [{"name": "skill-name", "purpose": "one line"}]}
 {"action": "organize", "path": "/folder/path"}
 {"action": "research", "query": "complex question", "n": 8}
+{"action": "brainstorm", "query": "topic to brainstorm"}
+{"action": "chess", "query": "FEN, move list (1. e4 e5 ...), 'start', or 'play me'"}
+{"action": "chess_vs", "query": "elo number for jorge (e.g. 1500)"}
+{"action": "chess_move", "query": "your move in SAN (e.g. e4, Nf3, O-O) or 'resign'"}
 {"action": "email_draft", "to": "recipient@example.com", "subject": "...", "topic": "what it should say", "tone": "professional|friendly|casual|formal|warm|direct|urgent", "context": "optional extra context", "recall": true}
 {"action": "monitor", "top": 5, "cpu": 90, "mem": 85, "disk": 90}
 {"action": "delegate_breakdown", "task": "the complex task", "dir": "optional folder", "steps": 5}
@@ -1371,6 +1410,8 @@ You must reply with ONLY one JSON object, no markdown fences, no extra text, no 
 {"action": "browser_2fa", "site": "discord.com", "code": "123456"}
 
 Rules:
+- If the user's message starts with an email address (e.g. "email someone@x.com ask about X") -> action email with that exact address, subject and topic derived from the rest. NEVER use action browser or chat for sending emails.
+- NEVER claim an email was sent unless you actually ran the email action. If you didn't run it, say you couldn't send it.
 - If the user asks to email/send a message -> action email. Extract recipient, subject, and the content/topic. To find the recipient's address: FIRST check the Memory notes for a "CONTACT: <Name>'s email is <addr>" entry, THEN recent conversation history, THEN ask the user. Never invent or guess an email address.
 - If the user asks to search/check something online -> action web. If the user wants a deeper, cited research summary of a complex question -> action research.
 - RESEARCH FIRST: if the user asks a question or asks you to plan something, search the web first (action web or action research, multiple targeted queries) and read at least 5 sources before answering. Base your answer on those sources and cite a couple of them. Skip research only for questions about the user/jorge itself, memory notes, or small talk.
@@ -1378,6 +1419,8 @@ Rules:
 - If the user asks to draft an email with a specific tone (professional/friendly/casual/formal/warm/direct/urgent) or wants a draft they can review before sending -> action email_draft.
 - If the user asks to check system resources, CPU/memory/disk usage, running processes, or wants alerts on thresholds -> action monitor.
 - If the user asks to plan/break down a complex multi-step task into sub-tasks (then delegate them) -> action delegate_breakdown.
+- If the user asks about chess (analyze a position, best move, who's winning, what should I play) or wants to play a game -> action chess. Positions can be a FEN, a move list (1. e4 e5 ...), or 'start'. If they say 'play me', analyze the current position and play the best move from the result.
+- If the user wants to PLAY chess against jorge (vs, play a game, challenge) -> action chess_vs with an elo number (jorge's strength, 500-3190). When the user then sends a chess move (e4, Nf3, O-O, 'resign') -> action chess_move with that move. Report the board from the tool output.
 - If the user asks to do something in a real web browser (login to sites, create a Discord server/channel, fill forms, download files, take screenshots) -> action browser with task = exactly what the user asked. It may also be needed when the info is only reachable behind a login. It needs plan-mode approval like shell.
 - BROWSER LOGIN FLOW: when a browser action reports it needs credentials or a 2FA code for a site, repeat that question to the user as your reply. When the user replies with the credentials (email/password) or a 2FA code, FIRST save them with action browser_creds (site, email, password) or browser_2fa (site, code), THEN retry the original browser task. Never guess or invent credentials.
 - ACCOUNT LOGINS ARE ALLOWED: the user owns this machine and these accounts. When the user asks you to log into THEIR OWN account (Discord, Spotify, email, etc.) or do things inside it (create servers, join servers, manage things), that is normal, permitted work — do it with action browser. Do NOT refuse or lecture about safety; do NOT use browser_creds/browser_2fa to guess credentials. Never log in to accounts the user did not ask about, and never share the stored credentials with anyone.
@@ -1487,7 +1530,7 @@ def api_call(env: dict[str, str], payload: dict[str, Any], json_mode: bool = Tru
     try:
         state = _load_model_state()
         now = time.time()
-        skip = {m: t for m, t in state.get("skip", {}).items() if now - t < MODEL_QUARANTINE_H * 3600}
+        skip = {m: t for m, t in state.get("skip", {}).items() if now - t < MODEL_QUARANTINE_MIN * 60}
         pool = []
         for m in [env.get("AI_MODEL", DEFAULT_MODEL)] + FALLBACK_MODELS:
             if m not in pool and m not in skip:
@@ -1498,52 +1541,65 @@ def api_call(env: dict[str, str], payload: dict[str, Any], json_mode: bool = Tru
         models = [chosen] + [m for m in pool if m != chosen]
         tried = []
         last_err = "no model tried"
-        for model in models:
-            if model in tried:
-                continue
-            tried.append(model)
-            for attempt in range(2):
-                body = {**payload, "model": model}
-                if attempt == 1:
-                    body.pop("response_format", None)
-                try:
-                    r = requests.post(url, headers=headers, json=body, timeout=120)
-                except requests.RequestException as e:
-                    last_err = f"request failed: {e}"
-                    time.sleep(2)
+        for _round in range(2):
+            if _round > 0:
+                time.sleep(5)
+            for model in models:
+                if model in tried:
                     continue
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("choices"):
-                        content = data["choices"][0]["message"].get("content") or ""
-                        if content.strip():
-                            if json_mode and not _looks_parseable(content):
-                                state.setdefault("skip", {})[model] = now
+                tried.append(model)
+                for attempt in range(2):
+                    body = {**payload, "model": model}
+                    if attempt == 1:
+                        body.pop("response_format", None)
+                    try:
+                        r = requests.post(url, headers=headers, json=body, timeout=120)
+                    except requests.RequestException as e:
+                        last_err = f"request failed: {e}"
+                        time.sleep(2)
+                        continue
+                    if r.status_code == 200:
+                        data = r.json()
+                        if data.get("choices"):
+                            content = data["choices"][0]["message"].get("content") or ""
+                            if content.strip():
+                                if json_mode and not _looks_parseable(content):
+                                    state.setdefault("skip", {})[model] = now
+                                    _save_model_state(state)
+                                    last_err = f"{model} returned unparseable output (quarantined {MODEL_QUARANTINE_MIN}min)"
+                                    break
+                                state.setdefault("skip", {}).pop(model, None)
                                 _save_model_state(state)
-                                last_err = f"{model} returned unparseable output (quarantined {MODEL_QUARANTINE_H}h)"
-                                break
-                            state.setdefault("skip", {}).pop(model, None)
-                            _save_model_state(state)
-                            return (
-                                content.strip(),
-                                data.get("usage", {}),
-                                data.get("model", env.get("AI_MODEL", DEFAULT_MODEL)),
-                            )
-                    last_err = "API returned empty reply"
-                    continue
-                if r.status_code == 429:
-                    state.setdefault("skip", {})[model] = now
-                    _save_model_state(state)
-                    last_err = "API error 429 (quota)"
+                                global LAST_MODEL
+                                LAST_MODEL = data.get("model", env.get("AI_MODEL", DEFAULT_MODEL))
+                                return (
+                                    content.strip(),
+                                    data.get("usage", {}),
+                                    data.get("model", env.get("AI_MODEL", DEFAULT_MODEL)),
+                                )
+                        last_err = "API returned empty reply"
+                        if attempt == 0:
+                            time.sleep(3)
+                            continue
+                    if r.status_code == 429:
+                        if attempt == 0:
+                            time.sleep(8)
+                            continue
+                        state.setdefault("skip", {})[model] = now
+                        _save_model_state(state)
+                        last_err = f"API error 429 (quota) — {model} quarantined {MODEL_QUARANTINE_MIN}min"
+                        break
+                    if r.status_code in (401, 403):
+                        raise RuntimeError(f"API error {r.status_code}: {r.text[:200]}")
+                    if r.status_code in (500, 502, 503, 504) and attempt == 0:
+                        time.sleep(4)
+                        continue
+                    if r.status_code == 400 and attempt == 0 and json_mode:
+                        last_err = f"API error 400 (retrying without json mode): {r.text[:100]}"
+                        continue
+                    last_err = f"API error {r.status_code}: {r.text[:120]}"
                     break
-                if r.status_code in (401, 403):
-                    raise RuntimeError(f"API error {r.status_code}: {r.text[:200]}")
-                if r.status_code == 400 and attempt == 0 and json_mode:
-                    last_err = f"API error 400 (retrying without json mode): {r.text[:100]}"
-                    continue
-                last_err = f"API error {r.status_code}: {r.text[:120]}"
-                break
-            time.sleep(1)
+                time.sleep(1)
         raise RuntimeError(last_err + f" (tried: {', '.join(tried)})")
     finally:
         spinner.stop()
@@ -2023,6 +2079,48 @@ def run_tool(env: dict[str, str], tool: dict[str, Any], history: list[dict[str, 
             ans = _source_fallback(results, "The summary model glitched — here's what the sources say:")
         srcs = "\n".join(f"{i}. {r['title']} — {r['url']}" for i, r in enumerate(results[:5], 1))
         return (ans or "No results found.") + "\n\nSources:\n" + srcs, True
+    if action == "brainstorm":
+        query = tool.get("query", "").strip()
+        if not query:
+            query = ask_bot("what should I brainstorm")
+        if not query:
+            return "Brainstorm cancelled — no topic given.", True
+        answer, usage, model = api_call(
+            env,
+            {
+                "messages": [
+                    {"role": "system", "content": "You are jorge's sharp brainstorming engine. Produce a structured brainstorm for the topic. Format EXACTLY like this (plain text, no markdown headers):\nCORE IDEAS\n- <idea>: <one-line why it works>\n...\nANGLES & APPROACHES\n- <angle>: <one line>\n...\nWILDCARDS\n- <wild idea>: <one line>\n...\nNEXT STEPS\n- <action>: <who/what/why one line>\n...\nAim for 8-12 ideas total, be specific and practical, no fluff."},
+                    {"role": "user", "content": f"Topic: {query}"},
+                ],
+                "temperature": 0.9,
+                "max_tokens": 900,
+            },
+            json_mode=False,
+        )
+        print(c("  ── BRAINSTORM ──", CYAN) + tokens_str(usage, model))
+        box(answer, GREEN)
+        return (answer or "No ideas came out — try again?").strip(), True
+    if action == "chess":
+        query = tool.get("query", "").strip()
+        if not query:
+            query = ask_bot("what chess position should I analyze")
+        if not query:
+            return "Chess cancelled — no position given.", True
+        print(c("  ♟ analyzing with stockfish…", CYAN))
+        return chess_bot.analyze(query), True
+    if action == "chess_vs":
+        elo = int(re.search(r"\d+", str(tool.get("query", ""))).group()) if re.search(r"\d+", str(tool.get("query", ""))) else 1200
+        print(c("  ♟ starting a game…", CYAN))
+        return chess_bot.new_game(str(tool.get("user", "default")), elo, str(tool.get("side") or "white")), True
+    if action == "chess_move":
+        print(c("  ♟ jorge thinking…", CYAN))
+        return chess_bot.play_move(str(tool.get("user", "default")), str(tool.get("query", "") or "")), True
+    if action == "chess_challenge":
+        return chess_bot.chess_challenge(str(tool.get("user", "default")), str(tool.get("query", "") or "")), True
+    if action == "chess_accept":
+        return chess_bot.chess_accept(str(tool.get("user", "default"))), True
+    if action == "chess_decline":
+        return chess_bot.chess_decline(str(tool.get("user", "default"))), True
     if action == "email_draft":
         to = tool.get("to", "").strip()
         subject = tool.get("subject", "").strip()
@@ -2377,7 +2475,7 @@ def _selection_context(line: str, history: list[dict[str, str]]) -> str:
     return f"{line.strip()}\n\n(The files you just listed and asked about — act on exactly these, do not ask again:\n{listing[:2000]}\n)"
 
 
-def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -> tuple[str, list[dict[str, str]]]:
+def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]], user: str = "default") -> tuple[str, list[dict[str, str]]]:
     low = line.strip().lower()
     m = re.match(r"plan mode (on|off)\b", low)
     if m:
@@ -2454,6 +2552,61 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
     history.append({"role": "user", "content": line})
     history = history[-MAX_HISTORY:]
     append_conversation({"role": "user", "content": line})
+    m = re.match(r"^(?:email|send(?: an)? email|send)\s+([\w.+-]+@[\w.-]+\.[\w.]+)\s*(.*)$", line, re.I)
+    if m:
+        to = m.group(1)
+        rest = m.group(2).strip()
+        subject, topic = "(no subject)", rest or "(no content)"
+        if rest:
+            try:
+                raw, _u, _m = chat_call(
+                    env,
+                    [
+                        {"role": "system", "content": 'Extract the subject and content instructions for an email from the user\'s request. Reply with ONLY JSON: {"subject": "...", "topic": "..."}. Subject: short (max 8 words). Topic: a clear instruction of what the email should say.'},
+                        {"role": "user", "content": rest},
+                    ],
+                    max_tokens=150,
+                )
+                j = json.loads(raw)
+                subject = str(j.get("subject") or subject)[:80]
+                topic = str(j.get("topic") or topic)
+            except Exception:
+                subject = f"About {' '.join(rest.split()[:6])}"
+        reply, done = run_tool(env, {"action": "email", "to": to, "subject": subject, "topic": topic}, history)
+        final_assistant_reply = reply.strip()
+        print(c("  > ", CYAN) + final_assistant_reply)
+        history.append({"role": "assistant", "content": final_assistant_reply})
+        history = history[-MAX_HISTORY:]
+        append_conversation({"role": "assistant", "content": final_assistant_reply})
+        return final_assistant_reply, history
+    chess_vs = re.search(
+        r"\bchess\b[^.!?\n]*(?:\b(?:vs|versus|against|play|game|match|challenge|fight)\b)|\b(?:vs|versus)\b[^.!?\n]*\bchess\b",
+        line,
+        re.I,
+    )
+    if chess_vs:
+        elo_m = re.search(r"\b(\d{3,4})\b", line)
+        elo = elo_m.group(1) if elo_m else "1200"
+        side = "black" if re.search(r"\b(?:you|u)\s+(?:start|move first|go first|begin)\b", line, re.I) else "white"
+        reply, done = run_tool(env, {"action": "chess_vs", "query": elo, "user": user, "side": side}, history)
+        final_assistant_reply = reply.strip()
+        print(c("  > ", CYAN) + final_assistant_reply)
+        history.append({"role": "assistant", "content": final_assistant_reply})
+        history = history[-MAX_HISTORY:]
+        append_conversation({"role": "assistant", "content": final_assistant_reply})
+        return final_assistant_reply, history
+    move_re = re.compile(
+        r"^(?:[a-h][1-8](?:[a-h][1-8])?(?:=[qrbn])?|[kqrbn][a-h1-8x=+@-]*|O-O(?:-O)?|0-0(?:-0)?|resign|surrender|gg|quit|board|fen|show|start)\s*$",
+        re.I,
+    )
+    if chess_bot.has_game(user) and move_re.match(line.strip()):
+        reply, done = run_tool(env, {"action": "chess_move", "query": line.strip(), "user": user}, history)
+        final_assistant_reply = reply.strip()
+        print(c("  > ", CYAN) + final_assistant_reply)
+        history.append({"role": "assistant", "content": final_assistant_reply})
+        history = history[-MAX_HISTORY:]
+        append_conversation({"role": "assistant", "content": final_assistant_reply})
+        return final_assistant_reply, history
     final_assistant_reply: str | None = None
     try:
         msgs = [{"role": "system", "content": _build_chat_system()}] + history
@@ -2527,6 +2680,8 @@ def brain_reply(env: dict[str, str], line: str, history: list[dict[str, str]]) -
                     msgs.append({"role": "user", "content": f"[tool result] queued for plan approval (plan mode): {step}"})
                     continue
             try:
+                if tool.get("action") in ("chess", "chess_vs", "chess_move"):
+                    tool["user"] = user
                 reply, done = run_tool(env, tool, history)
             except MissingInfo as mi:
                 final_assistant_reply = f"I need more info: {mi}."
@@ -2802,7 +2957,7 @@ def build_parser() -> argparse.ArgumentParser:
     iu.set_defaults(func=cmd_instagram_upload)
 
     rm = sub.add_parser("remember", help="store a note/topic jorge should remember")
-    rm.add_argument("text", nargs="?", default="")
+    rm.add_argument("text", nargs="*")
     rm.set_defaults(func=cmd_remember)
 
     mm = sub.add_parser("memory", help="show stored notes")

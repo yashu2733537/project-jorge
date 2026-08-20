@@ -222,10 +222,10 @@ class JorgeBody:
 
     def run_jorge(self, text: str) -> None:
         try:
-            subprocess.run(
-                ["python3", "assistant.py", "chat", "--once", text],
-                cwd=SCRIPT_DIR, capture_output=True, timeout=300,
-            )
+            import assistant
+            env = assistant.load_env()
+            history = assistant.load_conversation(12)
+            assistant.brain_reply(env, text, history)
         except Exception:
             pass
 

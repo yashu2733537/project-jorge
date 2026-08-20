@@ -169,6 +169,11 @@ def instagram_upload(file: str, caption: str = "", progress=None, headless: bool
                 ctx.close()
                 return "⚠ Share button not found. Screenshot: ~/Pictures/jorge_ig_share_fail.png"
             progress("🚀 sharing…")
+            uploaded = {"ok": False}
+            def _on_upload(r):
+                if "rupload" in r.url and r.status == 200:
+                    uploaded["ok"] = True
+            page.on("response", _on_upload)
             try:
                 dlg = page.query_selector('[role="dialog"]')
                 if dlg:
@@ -179,6 +184,12 @@ def instagram_upload(file: str, caption: str = "", progress=None, headless: bool
                         except Exception:
                             ai_sw.evaluate("el => el.click()")
                         page.wait_for_timeout(800)
+                for _ in range(30):
+                    if uploaded["ok"]:
+                        break
+                    page.wait_for_timeout(1000)
+                if not uploaded["ok"]:
+                    page.wait_for_timeout(4000)
                 share.evaluate("""el => {
                     const r = el.getBoundingClientRect();
                     let top = document.elementFromPoint(r.x + r.width/2, r.y + r.height/2);
@@ -203,33 +214,59 @@ def instagram_upload(file: str, caption: str = "", progress=None, headless: bool
                     configured["ok"] = True
             page.on("response", _on_resp)
             ok = False
-            for _ in range(30):
-                page.wait_for_timeout(2000)
-                if configured["ok"]:
-                    ok = True
+            share_tries = 0
+            while share_tries < 3:
+                share_tries += 1
+                if share_tries > 1:
+                    progress(f"🖱️ share didn't land — retrying ({share_tries}/3)")
+                    try:
+                        share = page.query_selector('div[role="button"]:has-text("Share"), button:has-text("Share")')
+                        share.evaluate("""el => {
+                            const r = el.getBoundingClientRect();
+                            let top = document.elementFromPoint(r.x + r.width/2, r.y + r.height/2);
+                            let n = 0;
+                            while (top && top !== el && n < 10) { top.style.pointerEvents = 'none'; top = document.elementFromPoint(r.x + r.width/2, r.y + r.height/2); n++; }
+                            return n;
+                        }""")
+                        page.wait_for_timeout(400)
+                        b3 = share.bounding_box()
+                        page.mouse.move(b3["x"] + b3["width"]/2, b3["y"] + b3["height"]/2, steps=3)
+                        page.wait_for_timeout(300)
+                        page.mouse.down()
+                        page.wait_for_timeout(200)
+                        page.mouse.up()
+                    except Exception:
+                        pass
+                ok = False
+                for _ in range(20):
+                    page.wait_for_timeout(2000)
+                    if configured["ok"]:
+                        ok = True
+                        break
+                    try:
+                        body = page.inner_text("body")
+                    except Exception:
+                        body = ""
+                    if re.search(r"(your (?:post|reel|video) (?:has been |is )?(?:shared|live)|post shared|shared your)", body, re.I):
+                        ok = True
+                        break
+                    try:
+                        dlg2 = page.query_selector('[role="dialog"]')
+                        dlg_open = dlg2 is not None and dlg2.is_visible()
+                    except Exception:
+                        dlg_open = True
+                    if not dlg_open:
+                        ok = True
+                        break
+                    for err in ("couldn't share", "couldn't publish", "something went wrong", "try again later",
+                            "action blocked", "temporarily blocked", "can't post", "cant post",
+                            "blocked from", "restricted"):
+                        if err in body.lower():
+                            page.screenshot(path=SHOTS_DIR / "jorge_ig_error.png")
+                            ctx.close()
+                            return f"⚠ Instagram rejected the post: '{err}' — screenshot: ~/Pictures/jorge_ig_error.png"
+                if ok:
                     break
-                try:
-                    body = page.inner_text("body")
-                except Exception:
-                    body = ""
-                if re.search(r"(your (?:post|reel|video) (?:has been |is )?(?:shared|live)|post shared|shared your)", body, re.I):
-                    ok = True
-                    break
-                try:
-                    dlg2 = page.query_selector('[role="dialog"]')
-                    dlg_open = dlg2 is not None and dlg2.is_visible()
-                except Exception:
-                    dlg_open = True
-                if not dlg_open:
-                    ok = True
-                    break
-                for err in ("couldn't share", "couldn't publish", "something went wrong", "try again later",
-                        "action blocked", "temporarily blocked", "can't post", "cant post",
-                        "blocked from", "restricted"):
-                    if err in body.lower():
-                        page.screenshot(path=SHOTS_DIR / "jorge_ig_error.png")
-                        ctx.close()
-                        return f"⚠ Instagram rejected the post: '{err}' — screenshot: ~/Pictures/jorge_ig_error.png"
             if ok:
                 for _ in range(10):
                     try:
@@ -245,7 +282,7 @@ def instagram_upload(file: str, caption: str = "", progress=None, headless: bool
                         page.wait_for_timeout(1500)
                     except Exception:
                         break
-                        username = "yashusingh774"
+            username = "yashusingh774"
             dlg_text = ""
             try:
                 dlg_text = page.inner_text("[role=dialog]") or ""
