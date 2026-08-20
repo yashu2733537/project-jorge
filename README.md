@@ -1,6 +1,6 @@
 # jorge — your personal AI assistant
 
-A terminal AI assistant that chats naturally, sends emails, searches the web, sorts files, remembers things, can edit its own code — and optionally runs as a WhatsApp bot.
+A terminal AI assistant that chats naturally, sends emails, searches the web, sorts files, remembers things, can edit its own code — with **Discord** (chat + chess + voice-music), **WhatsApp**, and a **voice GUI** frontend.
 
 ## What it can do
 
@@ -9,6 +9,11 @@ A terminal AI assistant that chats naturally, sends emails, searches the web, so
 - **Email drafting** — tone-aware drafts (professional/friendly/casual/formal/warm/direct/urgent) with optional conversation-context recall, reviewed before sending
 - **Web search** — DuckDuckGo search, with AI-summarized answers
 - **Web research** — deep searches summarized with numbered source citations
+- **Brainstorming** — structured CORE IDEAS / ANGLES / WILDCARDS / NEXT STEPS sessions
+- **Chess** — Stockfish-powered analysis and games:
+  - `@jorge chess <fen | move list | start>` — analyze any position (depth-16, top 3 moves + evals, mate/draw detection)
+  - `@jorge chess vs @user` — challenge another Discord user (they reply `?accept` / `?decline`)
+  - `?chess-vs <elo>` — play against jorge at 500–3190 elo, `?move <san>` to play
 - **File sorting** — organizes a folder into categories by file type
 - **File organization** — organizes by file type *and* naming patterns (IMG_, Screenshot, invoice, resume, …)
 - **Memory** — remembers notes you give it (`memory.txt`)
@@ -18,13 +23,35 @@ A terminal AI assistant that chats naturally, sends emails, searches the web, so
 - **Delegation** — hands big coding tasks to `opencode` (if installed), which does them fully autonomously
 - **Task breakdown** — splits a complex task into sub-steps, then delegates them
 - **Self-improvement** — tell it "build yourself new skills" and it proposes + creates real opencode skills
-- **WhatsApp bot** (optional) — talk to it from your own WhatsApp via the self-chat
+- **Instagram upload** — posts reels with a hardcoded browser flow (visible-window mode)
+
+## Frontends
+
+| Frontend | How |
+|---|---|
+| **Terminal** | `python3 assistant.py chat` |
+| **Voice GUI** | `jorge-voice` — tkinter avatar with Piper TTS + vosk STT, speaks replies, PLAN/BUILD mode badge, STFU button |
+| **Discord bot** | `cd discord-bot && npm install && node bot.js` — 25+ slash commands + `?` prefix commands |
+| **WhatsApp bot** | `cd whatsapp-bot && npm install && node bot.js` (uses your own "Message yourself" chat) |
+
+### Discord bot commands
+
+- `@jorge <msg>` / `/jorge` — the full brain (email, browser, research, chess…)
+- `/research <topic>` / `/brainstorm <topic>` / `@jorge research|brainstorm <t>` — cited research, structured ideas
+- `/chess <position>` / `/chess-vs [elo]` / `/move <san>` — analysis + games (unicode boards with coordinates)
+- Music in voice channels: `?play <song|URL|Spotify link>` `?skip` `?pause` `?resume` `?queue` `?np` `?stop` `?leave`
+- Moderation (owner-only): `?clear` `?kick` `?ban` `?unban` `?mute` `?unmute` `?warn` `?nick` `?setwelcome` `?quit`
+- Fun: `?roll` `?flip` `?8ball` `?say` `?avatar` `?userinfo` `?serverinfo` `?ping` `?info` `?help`
+- Owner = `DISCORD_OWNER_ID` in `.env`; email/shell/write/forget/sort/organize/delegate brain actions are owner-only too
 
 ## Requirements
 
 - Python 3.10+
 - `pip install -r requirements.txt`
 - An AI API key — any OpenAI-compatible endpoint works. Free option: OpenCode Zen (`https://opencode.ai`)
+- **Discord bot only**: Node.js 18+ (`cd discord-bot && npm install`) + a bot token (`DISCORD_TOKEN` in `.env`)
+- **Music only**: `ffmpeg` + `yt-dlp` (>= 2026, with a JS runtime — `--js-runtimes node`) on your PATH
+- **Chess only**: Stockfish binary (`~/.local/bin/stockfish` or on PATH) + `pip install python-chess`
 - **WhatsApp bot only**: Node.js 18+ (`cd whatsapp-bot && npm install`)
 - **Delegation only**: the `opencode` CLI on your PATH
 
@@ -53,6 +80,17 @@ python3 assistant.py help
 
 Tip: add an alias — `alias jorge="python3 /path/to/assistant.py"`.
 
+## Setup (Discord bot)
+
+```bash
+cd discord-bot
+npm install
+# set DISCORD_TOKEN (+ DISCORD_OWNER_ID for owner-only commands) in ../.env
+node bot.js
+```
+
+Invite the bot with Connect + Speak permissions (needed for music): `permissions=3214336`.
+
 ## Setup (WhatsApp bot)
 
 Links the bot to **your own WhatsApp account** — you talk to it in your "Message yourself" chat.
@@ -73,7 +111,7 @@ Optional env vars: `JORGE_PHONE=<international number without +>` enables pairin
 
 ## Model notes
 
-Models are picked by weighted rotation from `assistant.py` (`FALLBACK_MODELS` + `MODEL_WEIGHTS`). Models that return 429 (free quota exhausted) are auto-quarantined for 3 hours and rejoin when their quota resets. To see what models your account can use:
+Models are picked by weighted rotation from `assistant.py` (`FALLBACK_MODELS` + `MODEL_WEIGHTS`). Models that return 429 (free quota exhausted) are auto-quarantined for 15 minutes and rejoin when their quota resets. To see what models your account can use:
 
 ```bash
 curl -H "Authorization: Bearer $AI_API_KEY" https://opencode.ai/zen/v1/models
@@ -84,4 +122,5 @@ curl -H "Authorization: Bearer $AI_API_KEY" https://opencode.ai/zen/v1/models
 - `.env` contains your API key and Gmail app password — **never share it**
 - `wa_session/` contains your WhatsApp session — keep it private
 - The bot auto-approves actions (it's built to run unsupervised); use it on your own machine at your own risk
+- Email + shell + file-mutation brain actions are owner-only on Discord (`DISCORD_OWNER_ID`)
 - The Godot game project is hard-blocked from delegation — you can change the keyword list in `run_delegate()`
