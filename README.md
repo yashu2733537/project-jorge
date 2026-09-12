@@ -1,6 +1,6 @@
 # jorge — your personal AI assistant
 
-A terminal AI assistant that chats naturally, sends emails, searches the web, sorts files, remembers things, can edit its own code — with **Discord** (chat + chess + voice-music), **WhatsApp**, and a **voice GUI** frontend.
+A terminal AI assistant that chats naturally, sends emails, searches the web, sorts files, remembers things, can edit its own code — with **Discord** (chat + chess + voice-music), **WhatsApp**, **Telegram**, a **voice GUI**, and a **beautiful Textual TUI** frontend.
 
 ## What it can do
 
@@ -30,9 +30,11 @@ A terminal AI assistant that chats naturally, sends emails, searches the web, so
 | Frontend | How |
 |---|---|
 | **Terminal** | `python3 assistant.py chat` |
+| **TUI** | `python3 assistant.py tui` — a beautiful Textual interface (markdown bubbles, live system sidebar, memory panel) |
 | **Voice GUI** | `jorge-voice` — tkinter avatar with Piper TTS + vosk STT, speaks replies, PLAN/BUILD mode badge, STFU button |
 | **Discord bot** | `cd discord-bot && npm install && node bot.js` — 25+ slash commands + `?` prefix commands |
 | **WhatsApp bot** | `cd whatsapp-bot && npm install && node bot.js` (uses your own "Message yourself" chat) |
+| **Telegram bot** | `cd telegram-bot && npm install && node bot.js` |
 
 ### Discord bot commands
 
@@ -49,10 +51,12 @@ A terminal AI assistant that chats naturally, sends emails, searches the web, so
 - Python 3.10+
 - `pip install -r requirements.txt`
 - An AI API key — any OpenAI-compatible endpoint works. Free option: OpenCode Zen (`https://opencode.ai`)
+- **TUI only**: `textual` (included in requirements.txt)
 - **Discord bot only**: Node.js 18+ (`cd discord-bot && npm install`) + a bot token (`DISCORD_TOKEN` in `.env`)
 - **Music only**: `ffmpeg` + `yt-dlp` (>= 2026, with a JS runtime — `--js-runtimes node`) on your PATH
 - **Chess only**: Stockfish binary (`~/.local/bin/stockfish` or on PATH) + `pip install python-chess`
 - **WhatsApp bot only**: Node.js 18+ (`cd whatsapp-bot && npm install`)
+- **Telegram bot only**: Node.js 18+ (`cd telegram-bot && npm install`) + a bot token from [@BotFather](https://t.me/BotFather) (`TELEGRAM_TOKEN` in `.env`)
 - **Delegation only**: the `opencode` CLI on your PATH
 
 ## Setup (terminal assistant)
@@ -67,6 +71,7 @@ cp .env.example .env
 
 # 3. Run it
 python3 assistant.py chat          # interactive chat
+python3 assistant.py tui           # beautiful TUI with markdown bubbles + live system sidebar
 python3 assistant.py email --to friend@example.com --subject "Hi" --topic "say hello"
 python3 assistant.py email-draft --to friend@example.com --topic "ask about saturday" --tone friendly --recall
 python3 assistant.py web "best free vps 2026" --ask
@@ -90,6 +95,21 @@ node bot.js
 ```
 
 Invite the bot with Connect + Speak permissions (needed for music): `permissions=3214336`.
+
+## Setup (Telegram bot)
+
+```bash
+cd telegram-bot
+npm install
+# set TELEGRAM_TOKEN (+ optional TELEGRAM_OWNER_ID for an owner lock) in ../.env
+node bot.js
+```
+
+1. Create the bot with **@BotFather** (`/newbot`) and put the token in `.env` as `TELEGRAM_TOKEN`.
+2. Optional: set `TELEGRAM_OWNER_ID` (get it from @userinfobot) to lock the bot to just you.
+3. Message the bot — `/jorge <msg>` (or just type, in a private chat). Set the bot's privacy mode *off* in BotFather if you want it to read group messages that don't mention it.
+
+Commands: `/jorge <msg>` `/research <topic>` `/brainstorm <topic>` `/chess <position>` `/chess-vs [elo]` `/move <san>` `/abort` `/status` `/ping` `/help`.
 
 ## Setup (WhatsApp bot)
 
