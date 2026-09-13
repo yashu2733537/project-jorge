@@ -273,6 +273,7 @@ async function runCommand(client, ctx, name, args) {
         "🛠️ `?ping` `?info` `?help` `?userinfo [@u]` `?serverinfo` `?avatar [@u]`\n" +
         "🎮 `?roll 2d6` `?flip` `?8ball <q>` `?say <text>` `?nick <name>`\n" +
         "🎵 `?play <song or url>` `?skip` `?stop` `?pause` `?resume` `?queue` `?np` `?leave`\n" +
+        "🔊 `?volume [0-200]` `?loop [off|one|all]` `?shuffle` `?autoplay [on|off]`\n" +
         "🛡️ `?clear <n>` `?kick @u [why]` `?ban @u [why]` `?unban <id>` `?mute @u` `?unmute @u` `?warn @u <why>`\n" +
         "🏠 `?setwelcome #channel` (or off) — welcome messages\n" +
         "⚡ `?status` · `@jorge abort` — stop a running task"

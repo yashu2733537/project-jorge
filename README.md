@@ -41,7 +41,7 @@ A terminal AI assistant that chats naturally, sends emails, searches the web, so
 - `@jorge <msg>` / `/jorge` — the full brain (email, browser, research, chess…)
 - `/research <topic>` / `/brainstorm <topic>` / `@jorge research|brainstorm <t>` — cited research, structured ideas
 - `/chess <position>` / `/chess-vs [elo]` / `/move <san>` — analysis + games (unicode boards with coordinates)
-- Music in voice channels: `?play <song|URL|Spotify link>` `?skip` `?pause` `?resume` `?queue` `?np` `?stop` `?leave`
+- Music in voice channels: `?play <song|URL|Spotify link>` `?skip` `?pause` `?resume` `?queue` `?np` `?stop` `?leave` `?volume [0-200]` `?loop [off|one|all]` `?shuffle` `?autoplay [on|off]`
 - Moderation (owner-only): `?clear` `?kick` `?ban` `?unban` `?mute` `?unmute` `?warn` `?nick` `?setwelcome` `?quit`
 - Fun: `?roll` `?flip` `?8ball` `?say` `?avatar` `?userinfo` `?serverinfo` `?ping` `?info` `?help`
 - Owner = `DISCORD_OWNER_ID` in `.env`; email/shell/write/forget/sort/organize/delegate brain actions are owner-only too
@@ -50,7 +50,7 @@ A terminal AI assistant that chats naturally, sends emails, searches the web, so
 
 - Python 3.10+
 - `pip install -r requirements.txt`
-- An AI API key — any OpenAI-compatible endpoint works. Free option: OpenCode Zen (`https://opencode.ai`)
+- An AI API key — any OpenAI-compatible endpoint works. Free options: Google Gemini (`AI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`, `AI_MODEL=gemini-3.1-flash-lite`) or OpenRouter
 - **TUI only**: `textual` (included in requirements.txt)
 - **Discord bot only**: Node.js 18+ (`cd discord-bot && npm install`) + a bot token (`DISCORD_TOKEN` in `.env`)
 - **Music only**: `ffmpeg` + `yt-dlp` (>= 2026, with a JS runtime — `--js-runtimes node`) on your PATH
