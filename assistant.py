@@ -46,7 +46,7 @@ import chess_bot
 __version__ = "2.1.0"
 
 # OpenRouter free model
-DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_BASE = "https://openrouter.ai/api/v1"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -1440,7 +1440,7 @@ Rules:
 """
 
 
-FALLBACK_MODELS = ["deepseek-v4-flash-free", "nemotron-3-ultra-free", "nemotron-3.5-lightning-free", "laguna-s-2.1-free", "mimo-v2.5-free", "hy3-free", "big-pickle"]
+FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-3-perftune-flash"]
 
 MODEL_WEIGHTS = {
     "laguna-s-2.1-free": 5,

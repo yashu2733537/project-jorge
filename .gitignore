@@ -34,4 +34,5 @@ chess_games.json
 chess_challenges.json
 
 # discord chat histories (runtime)
-dc_history_*.json
+dc*_history_*.json
+music_cache/

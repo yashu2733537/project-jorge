@@ -443,6 +443,7 @@ function buildIntents(privileged) {
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildVoiceStates,
   ];
   if (privileged) {
     intents.push(GatewayIntentBits.MessageContent);
@@ -593,6 +594,10 @@ function makeClient(intents) {
             if (cname === "queue") return music.queue(msg);
             if (cname === "np" || cname === "nowplaying") return music.queue(msg);
             if (cname === "leave") return music.leave(msg);
+            if (cname === "volume" || cname === "vol") return music.volume(msg, args.text);
+            if (cname === "loop") return music.loop(msg, args.text);
+            if (cname === "shuffle") return music.shuffle(msg);
+            if (cname === "autoplay") return music.autoplay(msg, args.text);
             const userArg = msg.mentions.users?.first?.();
             if (userArg) {
               if (cname === "kick" || cname === "ban" || cname === "mute" || cname === "unmute" || cname === "warn") {
