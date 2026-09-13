@@ -1,0 +1,13 @@
+{
+  "name": "jorge-telegram-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "jorge on Telegram — same brain, bridge-driven",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}

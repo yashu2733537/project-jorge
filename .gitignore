@@ -28,6 +28,7 @@ __pycache__/
 # node
 whatsapp-bot/node_modules/
 discord-bot/node_modules/
+telegram-bot/node_modules/
 
 # chess game state (runtime)
 chess_games.json
@@ -35,4 +36,9 @@ chess_challenges.json
 
 # discord chat histories (runtime)
 dc*_history_*.json
+
+# telegram chat histories (runtime, prefix tg)
+tg*_history_*.json
+
+# music cache (downloads)
 music_cache/

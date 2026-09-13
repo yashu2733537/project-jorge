@@ -2889,6 +2889,18 @@ def cmd_chat(args: argparse.Namespace, env: dict[str, str]) -> None:
         reply, history = brain_reply(env, line, history)
 
 
+def cmd_tui(args: argparse.Namespace, env: dict[str, str]) -> None:
+    """Launch the beautiful Textual TUI (jorge_tui.py)."""
+    try:
+        import jorge_tui
+    except ImportError as e:
+        print(c("✗ the TUI needs Textual — run: ", BOLD, RED) + c("pip install textual", BOLD, GREEN))
+        print(c(f"  (missing: {e})", GRAY))
+        sys.exit(1)
+    history = load_conversation(14)
+    jorge_tui.JorgeTUI(history=history).run()
+
+
 def show_menu() -> None:
     print(BANNER)
     header("How can I help?")
@@ -2967,6 +2979,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--once", default=None, help="process one message and exit (for voice/avatar use)")
     c.set_defaults(func=cmd_chat)
 
+    tui = sub.add_parser("tui", help="beautiful terminal UI chat (pip install textual)")
+    tui.set_defaults(func=cmd_tui)
+
     fg = sub.add_parser("forget", help="clear all stored notes")
     fg.set_defaults(func=cmd_forget)
 
@@ -2993,9 +3008,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     mo = sub.add_parser("monitor", help="system resources, disk, processes with alerts")
     mo.add_argument("--top", type=int, default=5, help="top N processes")
-    mo.add_argument("--cpu", type=float, default=90, help="cpu alert threshold %")
-    mo.add_argument("--mem", type=float, default=85, help="memory alert threshold %")
-    mo.add_argument("--disk", type=float, default=90, help="disk alert threshold %")
+    mo.add_argument("--cpu", type=float, default=90, help="cpu alert threshold %%")
+    mo.add_argument("--mem", type=float, default=85, help="memory alert threshold %%")
+    mo.add_argument("--disk", type=float, default=90, help="disk alert threshold %%")
     mo.set_defaults(func=cmd_monitor)
 
     db = sub.add_parser("breakdown", help="break a complex task into sub-tasks and delegate")
@@ -3009,7 +3024,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def dispatch(argv: list[str], env: dict[str, str]) -> None:
     args = build_parser().parse_args(argv)
-    if args.command in ("email", "web", "music", "chat", "remember", "memory", "forget", "research", "email-draft", "breakdown", "browser", "browser-login", "instagram-upload"):
+    if args.command in ("email", "web", "music", "chat", "remember", "memory", "forget", "research", "email-draft", "breakdown", "browser", "browser-login", "instagram-upload", "tui"):
         args.func(args, env)
     else:
         args.func(args)
